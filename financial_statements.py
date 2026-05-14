@@ -914,8 +914,8 @@ def _font(bold=False, size=10, color=C_BLACK, name="Calibri") -> Font:
 def _align(h="left", v="center", wrap=False) -> Alignment:
     return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
 
-INR = '#,##0'          # Indian number format (openpyxl uses comma-separated)
-INR2 = '#,##0.00'
+INR = '#,##0;(#,##0);"-"'   # accounting style: negatives in parens, zero as dash
+INR2 = '#,##0.00;(#,##0.00);"-"'
 
 def _fmt(ws, cell_ref: str, value: float | None, italic: bool = False) -> None:
     cell = ws[cell_ref]
@@ -934,18 +934,20 @@ class ExcelWriter:
         self.wb.remove(self.wb.active)  # remove default sheet
 
     def save(self, path: str) -> None:
+        # Write note sheets FIRST so BS can reference their total cells via formulas.
+        self.note_refs: dict[int, str] = {}
+        self.note_refs[1]  = self._write_note_share_capital()
+        self.note_refs[2]  = self._write_note_reserves()
+        self.note_refs[3]  = self._write_note_lt_borrowings()
+        self.note_refs[4]  = self._write_note_st_borrowings()
+        self.note_refs[5]  = self._write_note_trade_payables()
+        self.note_refs[8]  = self._write_note_fixed_assets()
+        self.note_refs[11] = self._write_note_inventories()
+        self.note_refs[12] = self._write_note_trade_receivables()
+        self.note_refs[13] = self._write_note_cash_bank()
+        # Now BS + PnL (can reference note total cells)
         self._write_bs()
         self._write_pnl()
-        # Note sheets (referenced by hyperlinks in BS face)
-        self._write_note_share_capital()
-        self._write_note_reserves()
-        self._write_note_lt_borrowings()
-        self._write_note_st_borrowings()
-        self._write_note_trade_payables()
-        self._write_note_fixed_assets()
-        self._write_note_inventories()
-        self._write_note_trade_receivables()
-        self._write_note_cash_bank()
         self._write_notes_index()
         if self.proj:
             pe = ProjectionEngine(self.fd, self.proj)
@@ -954,7 +956,24 @@ class ExcelWriter:
             self._write_assumptions()
         vr = validate_financial_data(self.fd)
         self._write_validation(vr)
+        # Reorder + activate the Balance Sheet so the file opens to it
+        self._reorder_sheets()
         self.wb.save(path)
+
+    def _reorder_sheets(self) -> None:
+        preferred = ["Balance Sheet", "P&L Statement",
+                     "Projected Balance Sheet", "Projected P&L",
+                     "Assumptions", "Notes Index"]
+        order: list[str] = []
+        for name in preferred:
+            if name in self.wb.sheetnames:
+                order.append(name)
+        for name in self.wb.sheetnames:
+            if name not in order:
+                order.append(name)
+        self.wb._sheets = [self.wb[n] for n in order]
+        if "Balance Sheet" in self.wb.sheetnames:
+            self.wb.active = self.wb.sheetnames.index("Balance Sheet")
 
     # ── Validation sheet ──────────────────────────────────────────────────────
 
@@ -1054,25 +1073,37 @@ class ExcelWriter:
 
         def row(label, amount, note=None, indent=0, bold=False, total=False, fmt=INR):
             nonlocal r
-            prefix = "  " * indent
+            prefix = "    " * indent
             ws[f"A{r}"].value = prefix + label
             ws[f"A{r}"].font = _font(bold=bold or total, size=10)
             ws[f"A{r}"].alignment = _align("left")
-            if note:
-                note_sheet_name = self._note_sheet_name(int(note))
-                ws[f"B{r}"].value = note
+            if note is not None:
+                note_num = int(note)
+                note_sheet_name = self._note_sheet_name(note_num)
+                ws[f"B{r}"].value = note_num
                 ws[f"B{r}"].hyperlink = f"#'{note_sheet_name}'!A1"
                 ws[f"B{r}"].font = Font(name="Calibri", size=9, color="1D4ED8", underline="single")
                 ws[f"B{r}"].alignment = _align("center")
-            if amount is not None:
+                # Prefer formula link to the note's total cell if available
+                ref = self.note_refs.get(note_num) if hasattr(self, "note_refs") else None
+                if ref:
+                    ws[f"C{r}"].value = f"={ref}"
+                elif amount is not None:
+                    ws[f"C{r}"].value = amount
+                ws[f"C{r}"].number_format = fmt
+                ws[f"C{r}"].font = _font(bold=bold or total, size=10)
+                ws[f"C{r}"].alignment = _align("right")
+            elif amount is not None:
                 ws[f"C{r}"].value = amount
                 ws[f"C{r}"].number_format = fmt
                 ws[f"C{r}"].font = _font(bold=bold or total, size=10)
                 ws[f"C{r}"].alignment = _align("right")
+            # Light borders on every data row for a clean tabular look
+            for col in "ABCD":
+                ws[f"{col}{r}"].border = _border()
             if total:
-                for col in "AC":
+                for col in "ABCD":
                     ws[f"{col}{r}"].fill = _fill(C_TOTAL_BG)
-                    ws[f"{col}{r}"].border = _border()
             r += 1
             return r - 1  # return row number for formula references
 
@@ -1088,88 +1119,81 @@ class ExcelWriter:
 
         # ── EQUITY & LIABILITIES ──────────────────────────────────────────────
         subheader("I.  SHAREHOLDERS' FUNDS")
-        sc_r  = row("  a)  Share Capital",           fd.share_capital(),       note="1", indent=0)
-        res_r = row("  b)  Reserves & Surplus",      fd.reserves_surplus(),    note="2", indent=0)
-        row("Total Shareholders' Funds",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{sc_r}+C{res_r}"
-        ws[f"C{r-1}"].number_format = INR
+        sc_r  = row("a)  Share Capital",           fd.share_capital(),       note="1",  indent=1)
+        res_r = row("b)  Reserves & Surplus",      fd.reserves_surplus(),    note="2",  indent=1)
+        sf_tot_r = row("Total Shareholders' Funds", None, bold=True, total=True)
+        ws[f"C{sf_tot_r}"].value = f"=C{sc_r}+C{res_r}"
+        ws[f"C{sf_tot_r}"].number_format = INR
         spacer()
 
         subheader("II.  NON-CURRENT LIABILITIES")
-        ltb_r = row("  a)  Long-Term Borrowings",    fd.long_term_borrowings(), note="3", indent=0)
-        dtl_r = row("  b)  Deferred Tax Liability",  fd.deferred_tax_liability(), indent=0)
-        row("Total Non-Current Liabilities",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{ltb_r}+C{dtl_r}"
-        ws[f"C{r-1}"].number_format = INR
+        ltb_r = row("a)  Long-Term Borrowings",    fd.long_term_borrowings(),  note="3", indent=1)
+        dtl_r = row("b)  Deferred Tax Liability",  fd.deferred_tax_liability(), indent=1)
+        ncl_tot_r = row("Total Non-Current Liabilities", None, bold=True, total=True)
+        ws[f"C{ncl_tot_r}"].value = f"=C{ltb_r}+C{dtl_r}"
+        ws[f"C{ncl_tot_r}"].number_format = INR
         spacer()
 
         subheader("III.  CURRENT LIABILITIES")
-        stb_r  = row("  a)  Short-Term Borrowings",  fd.short_term_borrowings(), note="4", indent=0)
-        tp_r   = row("  b)  Trade Payables",         fd.trade_payables(),         note="5", indent=0)
-        dt_r   = row("  c)  Duties & Taxes (Net)",   max(0, fd.duties_and_taxes_net()), indent=0)
-        ocl_r  = row("  d)  Other Current Liabilities", fd.other_current_liabilities(), note="6", indent=0)
-        prov_r = row("  e)  Short-Term Provisions",  fd.short_term_provisions(),  note="7", indent=0)
-        row("Total Current Liabilities",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{stb_r}+C{tp_r}+C{dt_r}+C{ocl_r}+C{prov_r}"
-        ws[f"C{r-1}"].number_format = INR
-        total_cl_r = r - 1
+        stb_r  = row("a)  Short-Term Borrowings",      fd.short_term_borrowings(), note="4", indent=1)
+        tp_r   = row("b)  Trade Payables",             fd.trade_payables(),         note="5", indent=1)
+        dt_r   = row("c)  Duties & Taxes (Net)",       max(0, fd.duties_and_taxes_net()), indent=1)
+        ocl_r  = row("d)  Other Current Liabilities",  fd.other_current_liabilities(), indent=1)
+        prov_r = row("e)  Short-Term Provisions",      fd.short_term_provisions(), indent=1)
+        cl_tot_r = row("Total Current Liabilities", None, bold=True, total=True)
+        ws[f"C{cl_tot_r}"].value = f"=C{stb_r}+C{tp_r}+C{dt_r}+C{ocl_r}+C{prov_r}"
+        ws[f"C{cl_tot_r}"].number_format = INR
         spacer()
 
-        # Grand total E&L
-        row("TOTAL EQUITY & LIABILITIES", None, bold=True)
-        ws[f"C{r-1}"].value = fd.total_equity_liabilities()
-        ws[f"C{r-1}"].number_format = INR
-        ws[f"C{r-1}"].font = _font(bold=True, size=11)
-        ws[f"C{r-1}"].fill = _fill(C_HEADER_BG)
-        ws[f"C{r-1}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
-        ws[f"A{r-1}"].fill = _fill(C_HEADER_BG)
-        ws[f"A{r-1}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
-        total_el_row = r - 1
+        # Grand total E&L  (formula = sum of subtotals)
+        tel_r = row("TOTAL EQUITY & LIABILITIES", None, bold=True)
+        ws[f"C{tel_r}"].value = f"=C{sf_tot_r}+C{ncl_tot_r}+C{cl_tot_r}"
+        ws[f"C{tel_r}"].number_format = INR
+        for col in "ABCD":
+            ws[f"{col}{tel_r}"].fill = _fill(C_HEADER_BG)
+            ws[f"{col}{tel_r}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
+        ws[f"C{tel_r}"].alignment = _align("right")
         spacer(); spacer()
 
         # ── ASSETS ───────────────────────────────────────────────────────────
         subheader("I.  NON-CURRENT ASSETS")
-        fa_r   = row("  a)  Fixed Assets (Net Block)",     fd.net_fixed_assets(),          note="8", indent=0)
-        inv_r  = row("  b)  Non-Current Investments",      fd.non_current_investments(),   note="9", indent=0)
-        lla_r  = row("  c)  Long-Term Loans & Advances",   fd.long_term_loans_advances(),  note="10", indent=0)
-        dta_r  = row("  d)  Deferred Tax Asset",           fd.deferred_tax_asset(),        indent=0)
-        ona_r  = row("  e)  Other Non-Current Assets",     fd.other_noncurrent_assets(),   indent=0)
-        row("Total Non-Current Assets",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{fa_r}+C{inv_r}+C{lla_r}+C{dta_r}+C{ona_r}"
-        ws[f"C{r-1}"].number_format = INR
+        fa_r   = row("a)  Fixed Assets (Net Block)",     fd.net_fixed_assets(),          note="8", indent=1)
+        inv_r  = row("b)  Non-Current Investments",      fd.non_current_investments(),   indent=1)
+        lla_r  = row("c)  Long-Term Loans & Advances",   fd.long_term_loans_advances(),  indent=1)
+        dta_r  = row("d)  Deferred Tax Asset",           fd.deferred_tax_asset(),        indent=1)
+        ona_r  = row("e)  Other Non-Current Assets",     fd.other_noncurrent_assets(),   indent=1)
+        nca_tot_r = row("Total Non-Current Assets", None, bold=True, total=True)
+        ws[f"C{nca_tot_r}"].value = f"=C{fa_r}+C{inv_r}+C{lla_r}+C{dta_r}+C{ona_r}"
+        ws[f"C{nca_tot_r}"].number_format = INR
         spacer()
 
         subheader("II.  CURRENT ASSETS")
-        stk_r  = row("  a)  Inventories (Closing Stock)",  fd.closing_stock(),             note="11", indent=0)
-        tr_r   = row("  b)  Trade Receivables",            fd.trade_receivables(),         note="12", indent=0)
-        cb_r   = row("  c)  Cash & Cash Equivalents",      fd.cash_and_bank(),             note="13", indent=0)
-        oca_r  = row("  d)  Other Current Assets",         fd.other_current_assets(),      note="14", indent=0)
-        row("Total Current Assets",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{stk_r}+C{tr_r}+C{cb_r}+C{oca_r}"
-        ws[f"C{r-1}"].number_format = INR
+        stk_r  = row("a)  Inventories (Closing Stock)",  fd.closing_stock(),             note="11", indent=1)
+        tr_r   = row("b)  Trade Receivables",            fd.trade_receivables(),         note="12", indent=1)
+        cb_r   = row("c)  Cash & Cash Equivalents",      fd.cash_and_bank(),             note="13", indent=1)
+        oca_r  = row("d)  Other Current Assets",         fd.other_current_assets(),      indent=1)
+        ca_tot_r = row("Total Current Assets", None, bold=True, total=True)
+        ws[f"C{ca_tot_r}"].value = f"=C{stk_r}+C{tr_r}+C{cb_r}+C{oca_r}"
+        ws[f"C{ca_tot_r}"].number_format = INR
         spacer()
 
-        row("TOTAL ASSETS", None, bold=True)
-        ws[f"C{r-1}"].value = fd.total_assets()
-        ws[f"C{r-1}"].number_format = INR
-        ws[f"C{r-1}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
-        ws[f"C{r-1}"].fill = _fill(C_HEADER_BG)
-        ws[f"A{r-1}"].fill = _fill(C_HEADER_BG)
-        ws[f"A{r-1}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
+        ta_r = row("TOTAL ASSETS", None, bold=True)
+        ws[f"C{ta_r}"].value = f"=C{nca_tot_r}+C{ca_tot_r}"
+        ws[f"C{ta_r}"].number_format = INR
+        for col in "ABCD":
+            ws[f"{col}{ta_r}"].fill = _fill(C_HEADER_BG)
+            ws[f"{col}{ta_r}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
+        ws[f"C{ta_r}"].alignment = _align("right")
         spacer(); spacer()
 
-        # ── Difference check ─────────────────────────────────────────────────
-        diff = fd.total_assets() - fd.total_equity_liabilities()
-        row("Balance Sheet Difference (should be 0)", diff,
-            bold=True if abs(diff) > 1 else False)
-        if abs(diff) > 1:
-            ws[f"C{r-1}"].fill = _fill("FF0000")
-            ws[f"C{r-1}"].font = Font(bold=True, size=10, color=C_WHITE)
+        # ── Difference check (formula-driven) ────────────────────────────────
+        diff_r = row("Balance Sheet Difference (should be 0)", None, bold=True)
+        ws[f"C{diff_r}"].value = f"=C{ta_r}-C{tel_r}"
+        ws[f"C{diff_r}"].number_format = INR
+        # Conditional-format the diff cell via a simple Python-side check on current data
+        if abs(fd.total_assets() - fd.total_equity_liabilities()) > 1:
+            ws[f"C{diff_r}"].fill = _fill("FF0000")
+            ws[f"C{diff_r}"].font = Font(bold=True, size=10, color=C_WHITE)
         spacer(); spacer()
 
         ws.freeze_panes = "A6"
@@ -1235,15 +1259,19 @@ class ExcelWriter:
             ws[f"B{r}"].fill = _fill(C_TOTAL_BG)
         return r + 1
 
-    def _write_note_share_capital(self):
+    def _note_total_ref(self, note_num: int, row: int) -> str:
+        return f"'{self._note_sheet_name(note_num)}'!B{row}"
+
+    def _write_note_share_capital(self) -> str:
         ws, r = self._start_note_sheet(1, "Share Capital")
         fd = self.fd
         for l in fd._ledgers_for("Capital Account"):
             if "reserve" not in l.name.lower() and "profit" not in l.name.lower():
                 r = self._note_data_row(ws, r, l.name, l.closing)
-        r = self._note_data_row(ws, r, "Total Share Capital", fd.share_capital(), total=True)
+        self._note_data_row(ws, r, "Total Share Capital", fd.share_capital(), total=True)
+        return self._note_total_ref(1, r)
 
-    def _write_note_reserves(self):
+    def _write_note_reserves(self) -> str:
         ws, r = self._start_note_sheet(2, "Reserves & Surplus")
         fd = self.fd
         for l in fd._ledgers_for("Capital Account"):
@@ -1252,9 +1280,10 @@ class ExcelWriter:
         for l in fd._ledgers_for("Reserves & Surplus"):
             r = self._note_data_row(ws, r, l.name, l.closing)
         r = self._note_data_row(ws, r, "Profit for the year (P&L A/c)", fd.pnl_balance)
-        r = self._note_data_row(ws, r, "Total Reserves & Surplus", fd.reserves_surplus(), total=True)
+        self._note_data_row(ws, r, "Total Reserves & Surplus", fd.reserves_surplus(), total=True)
+        return self._note_total_ref(2, r)
 
-    def _write_note_lt_borrowings(self):
+    def _write_note_lt_borrowings(self) -> str:
         ws, r = self._start_note_sheet(3, "Long-Term Borrowings")
         fd = self.fd
         for pg in ("Secured Loans", "Unsecured Loans", "Loans (Liability)"):
@@ -1264,9 +1293,10 @@ class ExcelWriter:
             r = self._note_data_row(ws, r, pg, bold=True)
             for l in group_ledgers:
                 r = self._note_data_row(ws, r, l.name, l.closing, indent=1)
-        r = self._note_data_row(ws, r, "Total Long-Term Borrowings", fd.long_term_borrowings(), total=True)
+        self._note_data_row(ws, r, "Total Long-Term Borrowings", fd.long_term_borrowings(), total=True)
+        return self._note_total_ref(3, r)
 
-    def _write_note_st_borrowings(self):
+    def _write_note_st_borrowings(self) -> str:
         ws, r = self._start_note_sheet(4, "Short-Term Borrowings")
         fd = self.fd
         for l in fd._ledgers_for("Bank OD A/c"):
@@ -1277,10 +1307,11 @@ class ExcelWriter:
             r = self._note_data_row(ws, r, "Bank Accounts (credit/OD balance)", bold=True)
             for l in od_banks:
                 r = self._note_data_row(ws, r, l.name, l.closing, indent=1)
-        r = self._note_data_row(ws, r, "Total Short-Term Borrowings",
-                                fd.short_term_borrowings() + fd.bank_od_in_bank_accounts(), total=True)
+        self._note_data_row(ws, r, "Total Short-Term Borrowings",
+                            fd.short_term_borrowings() + fd.bank_od_in_bank_accounts(), total=True)
+        return self._note_total_ref(4, r)
 
-    def _write_note_trade_payables(self):
+    def _write_note_trade_payables(self) -> str:
         ws, r = self._start_note_sheet(5, "Trade Payables")
         fd = self.fd
         by_parent: dict[str, float] = {}
@@ -1288,9 +1319,10 @@ class ExcelWriter:
             by_parent[l.parent] = by_parent.get(l.parent, 0) + l.closing
         for parent, amt in sorted(by_parent.items()):
             r = self._note_data_row(ws, r, parent, amt if amt > 0 else None)
-        r = self._note_data_row(ws, r, "Total Trade Payables", fd.trade_payables(), total=True)
+        self._note_data_row(ws, r, "Total Trade Payables", fd.trade_payables(), total=True)
+        return self._note_total_ref(5, r)
 
-    def _write_note_fixed_assets(self):
+    def _write_note_fixed_assets(self) -> str:
         ws, r = self._start_note_sheet(8, "Fixed Assets")
         fd = self.fd
         # Column headers
@@ -1320,15 +1352,17 @@ class ExcelWriter:
         ws[f"G{r}"].font = _font(bold=True, size=9)
         ws[f"G{r}"].fill = _fill(C_TOTAL_BG)
         ws[f"A{r}"].fill = _fill(C_TOTAL_BG)
+        return f"'{self._note_sheet_name(8)}'!G{r}"
 
-    def _write_note_inventories(self):
+    def _write_note_inventories(self) -> str:
         ws, r = self._start_note_sheet(11, "Inventories")
         fd = self.fd
         r = self._note_data_row(ws, r, "Opening Stock (as per books / override)", fd.opening_stock())
         r = self._note_data_row(ws, r, "Closing Stock (as per books / override)", fd.closing_stock())
-        r = self._note_data_row(ws, r, "Net Inventory on Balance Sheet", fd.closing_stock(), total=True)
+        self._note_data_row(ws, r, "Net Inventory on Balance Sheet", fd.closing_stock(), total=True)
+        return self._note_total_ref(11, r)
 
-    def _write_note_trade_receivables(self):
+    def _write_note_trade_receivables(self) -> str:
         ws, r = self._start_note_sheet(12, "Trade Receivables")
         fd = self.fd
         by_parent: dict[str, float] = {}
@@ -1336,9 +1370,10 @@ class ExcelWriter:
             by_parent[l.parent] = by_parent.get(l.parent, 0) + (-l.closing)
         for parent, amt in sorted(by_parent.items()):
             r = self._note_data_row(ws, r, parent, amt if abs(amt) > 0 else None)
-        r = self._note_data_row(ws, r, "Total Trade Receivables", fd.trade_receivables(), total=True)
+        self._note_data_row(ws, r, "Total Trade Receivables", fd.trade_receivables(), total=True)
+        return self._note_total_ref(12, r)
 
-    def _write_note_cash_bank(self):
+    def _write_note_cash_bank(self) -> str:
         ws, r = self._start_note_sheet(13, "Cash & Cash Equivalents")
         fd = self.fd
         if fd._ledgers_for("Cash-in-hand"):
@@ -1350,7 +1385,8 @@ class ExcelWriter:
             r = self._note_data_row(ws, r, "Bank Accounts (debit balance)", bold=True)
             for l in asset_banks:
                 r = self._note_data_row(ws, r, l.name, -l.closing, indent=1)
-        r = self._note_data_row(ws, r, "Total Cash & Cash Equivalents", fd.cash_and_bank(), total=True)
+        self._note_data_row(ws, r, "Total Cash & Cash Equivalents", fd.cash_and_bank(), total=True)
+        return self._note_total_ref(13, r)
 
     def _write_notes_index(self):
         ws = self.wb.create_sheet("Notes Index")
@@ -2531,9 +2567,7 @@ class App:
             return
         out = self._output_path("_Projected")
         try:
-            ew = ExcelWriter(fd, proj)
-            ew.wb.remove   # keep actual sheets too
-            ew.save(out)
+            ExcelWriter(fd, proj).save(out)
             self._set_status(f"Saved: {out}")
             if messagebox.askyesno("Done", f"Excel saved:\n{out}\n\nOpen it now?"):
                 os.startfile(out) if os.name == "nt" else os.system(f'open "{out}"')
