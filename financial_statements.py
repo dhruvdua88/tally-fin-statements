@@ -23,6 +23,8 @@ from openpyxl.styles import (
     Alignment, Border, Font, PatternFill, Side,
 )
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.worksheet.page import PageMargins
 
 # ─── Schedule III primary-group classification ────────────────────────────────
 # Values: (side, schedule_head, is_asset)
@@ -927,11 +929,33 @@ def _fmt(ws, cell_ref: str, value: float | None, italic: bool = False) -> None:
 
 
 class ExcelWriter:
-    def __init__(self, fd: FinancialData, proj: "ProjectionInputs | None" = None):
+    def __init__(self, fd: FinancialData, proj: "ProjectionInputs | None" = None,
+                 opts: "OutputOptions | None" = None):
         self.fd = fd
         self.proj = proj
+        self.opts = opts or OutputOptions()
         self.wb = openpyxl.Workbook()
         self.wb.remove(self.wb.active)  # remove default sheet
+
+    def _apply_page_setup(self, ws, *, landscape: bool = False, fit_height: int = 0) -> None:
+        """Fit to one page width, height auto (or capped). Adds A4 print setup."""
+        if not self.opts.page_setup:
+            return
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.orientation = (ws.ORIENTATION_LANDSCAPE if landscape
+                                     else ws.ORIENTATION_PORTRAIT)
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = fit_height  # 0 = auto
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_margins = PageMargins(left=0.5, right=0.5, top=0.6, bottom=0.6,
+                                       header=0.3, footer=0.3)
+        ws.print_options.horizontalCentered = True
+        ws.oddHeader.center.text = f"{self.fd.company}"
+        ws.oddHeader.center.size = 10
+        ws.oddFooter.right.text = "Page &P of &N"
+        ws.oddFooter.right.size = 9
+        ws.oddFooter.left.text = f"Generated {date.today().strftime('%d %b %Y')}"
+        ws.oddFooter.left.size = 9
 
     def save(self, path: str) -> None:
         # Write note sheets FIRST so BS can reference their total cells via formulas.
@@ -949,13 +973,28 @@ class ExcelWriter:
         self._write_bs()
         self._write_pnl()
         self._write_notes_index()
+        pe = None
         if self.proj:
             pe = ProjectionEngine(self.fd, self.proj)
             self._write_proj_pnl(pe)
             self._write_proj_bs(pe)
             self._write_assumptions()
+            if self.opts.cash_flow:
+                self._write_cash_flow(pe)
+        if self.opts.ratios:
+            self._write_ratios(pe)
+        if self.opts.common_size:
+            self._write_common_size(pe)
+        if self.opts.charts:
+            self._write_charts(pe)
         vr = validate_financial_data(self.fd)
         self._write_validation(vr)
+        # Apply page setup to every sheet
+        if self.opts.page_setup:
+            wide_sheets = {"Projected P&L", "Projected Balance Sheet", "Cash Flow",
+                           "Ratios", "Common-Size", "N8 Fixed Assets", "Validation"}
+            for ws in self.wb.worksheets:
+                self._apply_page_setup(ws, landscape=(ws.title in wide_sheets))
         # Reorder + activate the Balance Sheet so the file opens to it
         self._reorder_sheets()
         self.wb.save(path)
@@ -1098,6 +1137,13 @@ class ExcelWriter:
                 ws[f"C{r}"].number_format = fmt
                 ws[f"C{r}"].font = _font(bold=bold or total, size=10)
                 ws[f"C{r}"].alignment = _align("right")
+            # Always ensure the amount cell has the right format/alignment/weight,
+            # even on total rows whose formula is filled in by the caller after row().
+            ws[f"C{r}"].number_format = fmt
+            ws[f"C{r}"].alignment = _align("right")
+            if bold or total:
+                ws[f"A{r}"].font = _font(bold=True, size=10)
+                ws[f"C{r}"].font = _font(bold=True, size=10)
             # Light borders on every data row for a clean tabular look
             for col in "ABCD":
                 ws[f"{col}{r}"].border = _border()
@@ -1695,6 +1741,32 @@ class ExcelWriter:
                     ws[f"{col}{r}"].alignment = _align("right")
             r += 1
 
+        # Banker-view rows (DSCR, Interest Coverage) — only if requested
+        if self.opts.banker_view:
+            r += 1
+            ws.merge_cells(f"A{r}:E{r}")
+            ws[f"A{r}"].value = "BANKER METRICS"
+            ws[f"A{r}"].font = _font(bold=True, size=9, color=C_WHITE)
+            ws[f"A{r}"].fill = _fill(C_MID_BLUE)
+            r += 1
+            for metric, getter, fmt in [
+                ("DSCR (Debt Service Coverage)",
+                 lambda p: p.get("dscr"), '#,##0.00'),
+                ("Interest Coverage Ratio",
+                 lambda p: p.get("interest_coverage"), '#,##0.00'),
+            ]:
+                ws[f"A{r}"].value = "  " + metric
+                ws[f"A{r}"].font = _font(size=9, bold=True)
+                for col, p in zip(["C", "D", "E"], pnl):
+                    v = getter(p)
+                    if v is None:
+                        ws[f"{col}{r}"].value = "—"
+                    else:
+                        ws[f"{col}{r}"].value = v
+                        ws[f"{col}{r}"].number_format = fmt
+                    ws[f"{col}{r}"].alignment = _align("right")
+                r += 1
+
         ws.freeze_panes = "A5"
 
     # ── Projected Balance Sheet ───────────────────────────────────────────────
@@ -1792,6 +1864,24 @@ class ExcelWriter:
         for col in ["A","B","C","D","E"]:
             ws[f"{col}{r-1}"].font = Font(bold=True, size=10, color=C_WHITE, name="Calibri")
 
+        # Cash plug went negative in any year → flag the additional funding requirement
+        shortfalls = [b.get("cash_shortfall", 0) for b in bs]
+        if any(s > 0 for s in shortfalls):
+            r += 2
+            ws.merge_cells(f"A{r}:E{r}")
+            ws[f"A{r}"].value = "⚠  FUNDING SHORTFALL — additional borrowings required to balance"
+            ws[f"A{r}"].font = _font(bold=True, size=10, color="CC0000")
+            ws[f"A{r}"].fill = _fill("FFE0E0")
+            ws[f"A{r}"].alignment = _align("center")
+            r += 1
+            ws[f"A{r}"].value = "  Additional Short-Term Borrowing Needed"
+            ws[f"A{r}"].font = _font(bold=True, size=10)
+            for col, s in zip(["C", "D", "E"], shortfalls):
+                ws[f"{col}{r}"].value = s
+                ws[f"{col}{r}"].number_format = INR
+                ws[f"{col}{r}"].alignment = _align("right")
+                ws[f"{col}{r}"].font = _font(bold=True, color="CC0000")
+
         ws.freeze_panes = "A5"
 
     # ── Assumptions sheet ─────────────────────────────────────────────────────
@@ -1840,6 +1930,465 @@ class ExcelWriter:
         ws[f"A{len(rows)+3}"].font = _font(size=9, color="595959")
         ws[f"B{len(rows)+3}"].font = _font(size=9, color="595959")
 
+        if self.proj and self.proj.simple_mode:
+            sm_r = len(rows) + 5
+            ws[f"A{sm_r}"].value = "Mode: SIMPLE PROJECTION"
+            ws[f"A{sm_r}"].font = _font(bold=True, size=10, color="2E7D32")
+            ws[f"A{sm_r+1}"].value = ("Working capital days, OpEx growth, depreciation and interest "
+                                     "rates were defaulted from base year / standard rates.")
+            ws[f"A{sm_r+1}"].font = _font(size=9, color="595959")
+            ws[f"A{sm_r+1}"].alignment = _align("left", wrap=True)
+            ws.merge_cells(f"A{sm_r+1}:B{sm_r+1}")
+            ws.row_dimensions[sm_r+1].height = 32
+
+    # ── Ratios sheet ─────────────────────────────────────────────────────────
+
+    def _write_ratios(self, pe: "ProjectionEngine | None") -> None:
+        ws = self.wb.create_sheet("Ratios")
+        fd = self.fd
+        ws.column_dimensions["A"].width = 40
+        for col in "BCDE":
+            ws.column_dimensions[col].width = 16
+
+        years_count = 1 + (len(pe.projected_pnl()) if pe else 0)
+        last_col = chr(ord("B") + years_count - 1)
+
+        ws.merge_cells(f"A1:{last_col}1")
+        ws["A1"].value = f"{fd.company.upper()} — KEY FINANCIAL RATIOS"
+        ws["A1"].font = _font(bold=True, size=12, color=C_WHITE)
+        ws["A1"].fill = _fill(C_HEADER_BG)
+        ws["A1"].alignment = _align("center")
+
+        headers = ["Ratio", fd.period_label] + [f"Year {i+1}" for i in range(years_count - 1)]
+        for i, h in enumerate(headers):
+            col = chr(ord("A") + i)
+            ws[f"{col}2"].value = h
+            ws[f"{col}2"].font = _font(bold=True, size=9, color=C_WHITE)
+            ws[f"{col}2"].fill = _fill(C_MID_BLUE)
+            ws[f"{col}2"].alignment = _align("center" if i > 0 else "left")
+            ws[f"{col}2"].border = _border()
+
+        # Base-year metrics — protect against div-by-zero separately from the GP calc
+        rev_real = fd.revenue_from_ops()
+        rev = rev_real or 1
+        purchases = fd.purchases() or 1
+        gp_base = rev_real - fd.purchases() + (fd.closing_stock() - fd.opening_stock())
+        ebitda_base = fd.profit_before_tax() + fd.finance_costs() + fd.depreciation_from_fa()
+        curr_assets = fd.total_current_assets() or 0
+        curr_liab = fd.total_current_liab() or 1
+        debt = fd.long_term_borrowings() + fd.short_term_borrowings()
+        equity = fd.total_equity() or 1
+        interest = fd.finance_costs() or 0
+        net_worth = equity
+
+        def _row(label, base_val, proj_vals, fmt='#,##0.00', pct=False, group=False):
+            r = ws.max_row + 1
+            ws[f"A{r}"].value = label
+            ws[f"A{r}"].font = _font(bold=group, size=10)
+            if group:
+                for col_i in range(years_count + 1):
+                    col = chr(ord("A") + col_i)
+                    ws[f"{col}{r}"].fill = _fill(C_SUBHD_BG)
+                return
+            vals = [base_val] + (proj_vals or [])
+            for i, v in enumerate(vals):
+                col = chr(ord("B") + i)
+                if v is None:
+                    ws[f"{col}{r}"].value = "—"
+                else:
+                    ws[f"{col}{r}"].value = v if not pct else v / 100
+                    ws[f"{col}{r}"].number_format = "0.0%" if pct else fmt
+                ws[f"{col}{r}"].alignment = _align("right")
+                ws[f"{col}{r}"].border = _border()
+            ws[f"A{r}"].border = _border()
+
+        proj_pnl = pe.projected_pnl() if pe else []
+        proj_bs  = pe.projected_bs() if pe else []
+
+        _row("PROFITABILITY", None, None, group=True)
+        _row("Gross Margin %", gp_base / rev * 100,
+             [p["gross_margin_pct"] for p in proj_pnl], pct=True)
+        _row("EBITDA Margin %", ebitda_base / rev * 100,
+             [p["ebitda_margin"] for p in proj_pnl], pct=True)
+        _row("PAT Margin %", fd.profit_after_tax() / rev * 100,
+             [p["pat_margin"] for p in proj_pnl], pct=True)
+        _row("Return on Equity %", fd.profit_after_tax() / equity * 100,
+             [p["pat"] / max(1, b["total_equity"]) * 100 for p, b in zip(proj_pnl, proj_bs)], pct=True)
+        _row("Return on Capital Employed %",
+             (fd.profit_before_tax() + interest) / max(1, equity + debt) * 100,
+             [(p["pbt"] + p["finance"]) / max(1, b["total_equity"] + b["lt_borrowings"] + b["st_borrowings"]) * 100
+              for p, b in zip(proj_pnl, proj_bs)], pct=True)
+
+        _row("LIQUIDITY", None, None, group=True)
+        _row("Current Ratio", curr_assets / curr_liab,
+             [b.get("current_ratio") for b in proj_bs])
+        _row("Quick Ratio", (curr_assets - fd.closing_stock()) / curr_liab,
+             [(b["debtors"] + b["cash"] + b["other_ca"]) /
+              max(1, b["st_borrowings"] + b["trade_payables"] + b["other_cl"] + b["provisions"])
+              for b in proj_bs])
+
+        _row("LEVERAGE", None, None, group=True)
+        _row("Debt-to-Equity", debt / equity,
+             [(b["lt_borrowings"] + b["st_borrowings"]) / max(1, b["total_equity"]) for b in proj_bs])
+        _row("Interest Coverage", (fd.profit_before_tax() + interest) / max(1, interest),
+             [p.get("interest_coverage") for p in proj_pnl])
+        _row("DSCR (Debt Service Coverage)", None,
+             [p.get("dscr") for p in proj_pnl])
+
+        _row("EFFICIENCY (DAYS)", None, None, group=True)
+        _row("Inventory Days", fd.closing_stock() / purchases * 365,
+             [b["inventory"] / max(1, p["cogs"]) * 365 for p, b in zip(proj_pnl, proj_bs)],
+             fmt='#,##0')
+        _row("Debtor Days", fd.trade_receivables() / rev * 365,
+             [b["debtors"] / max(1, p["revenue"]) * 365 for p, b in zip(proj_pnl, proj_bs)],
+             fmt='#,##0')
+        _row("Creditor Days", fd.trade_payables() / purchases * 365,
+             [b["trade_payables"] / max(1, p["cogs"]) * 365 for p, b in zip(proj_pnl, proj_bs)],
+             fmt='#,##0')
+
+        ws.freeze_panes = "B3"
+
+    # ── Cash Flow Statement (Projected — indirect method) ────────────────────
+
+    def _write_cash_flow(self, pe: "ProjectionEngine") -> None:
+        ws = self.wb.create_sheet("Cash Flow")
+        fd = self.fd
+        ws.column_dimensions["A"].width = 46
+        for col in "BCD":
+            ws.column_dimensions[col].width = 18
+
+        ws.merge_cells("A1:D1")
+        ws["A1"].value = f"{fd.company.upper()} — PROJECTED CASH FLOW (INDIRECT METHOD)"
+        ws["A1"].font = _font(bold=True, size=12, color=C_WHITE)
+        ws["A1"].fill = _fill(C_HEADER_BG)
+        ws["A1"].alignment = _align("center")
+
+        for i, lbl in enumerate(["Particulars", "Year 1", "Year 2", "Year 3"]):
+            col = chr(ord("A") + i)
+            ws[f"{col}2"].value = lbl
+            ws[f"{col}2"].font = _font(bold=True, size=9, color=C_WHITE)
+            ws[f"{col}2"].fill = _fill(C_MID_BLUE)
+            ws[f"{col}2"].alignment = _align("center" if i > 0 else "left")
+            ws[f"{col}2"].border = _border()
+
+        pnl = pe.projected_pnl()
+        bs  = pe.projected_bs()
+
+        prev_bs = {
+            "debtors":        fd.trade_receivables(),
+            "inventory":      fd.closing_stock(),
+            "trade_payables": fd.trade_payables(),
+            "other_ca":       fd.other_current_assets(),
+            "other_cl":       fd.other_current_liabilities(),
+        }
+
+        def row(label, values, bold=False, total=False, italic=False):
+            r = ws.max_row + 1
+            ws[f"A{r}"].value = label
+            ws[f"A{r}"].font = _font(bold=bold or total, size=10) if not italic else \
+                              Font(italic=True, size=9, name="Calibri")
+            for i, v in enumerate(values):
+                col = chr(ord("B") + i)
+                if v is None:
+                    ws[f"{col}{r}"].value = "—"
+                else:
+                    ws[f"{col}{r}"].value = v
+                    ws[f"{col}{r}"].number_format = INR
+                ws[f"{col}{r}"].font = _font(bold=bold or total)
+                ws[f"{col}{r}"].alignment = _align("right")
+                ws[f"{col}{r}"].border = _border()
+            ws[f"A{r}"].border = _border()
+            if total:
+                for col in "ABCD":
+                    ws[f"{col}{r}"].fill = _fill(C_TOTAL_BG)
+            return r
+
+        ws[f"A3"].value = "Cash Flow from Operating Activities"
+        ws[f"A3"].font = _font(bold=True, size=10)
+        ws[f"A3"].fill = _fill(C_SUBHD_BG)
+        for col in "BCD":
+            ws[f"{col}3"].fill = _fill(C_SUBHD_BG)
+            ws[f"{col}3"].border = _border()
+        ws[f"A3"].border = _border()
+
+        row("Profit Before Tax", [p["pbt"] for p in pnl])
+        row("Add: Depreciation", [p["depreciation"] for p in pnl])
+        row("Add: Finance Costs", [p["finance"] for p in pnl])
+        # Working capital movements
+        wc_rows = []
+        for p, b in zip(pnl, bs):
+            dr_change   = -(b["debtors"] - prev_bs["debtors"])
+            inv_change  = -(b["inventory"] - prev_bs["inventory"])
+            cred_change =  (b["trade_payables"] - prev_bs["trade_payables"])
+            other_ca_c  = -(b["other_ca"] - prev_bs["other_ca"])
+            other_cl_c  =  (b["other_cl"] - prev_bs["other_cl"])
+            wc_rows.append((dr_change, inv_change, cred_change, other_ca_c, other_cl_c))
+            prev_bs = {
+                "debtors":        b["debtors"],
+                "inventory":      b["inventory"],
+                "trade_payables": b["trade_payables"],
+                "other_ca":       b["other_ca"],
+                "other_cl":       b["other_cl"],
+            }
+        row("Increase / (decrease) in Trade Payables", [w[2] for w in wc_rows])
+        row("(Increase) / decrease in Trade Receivables", [w[0] for w in wc_rows])
+        row("(Increase) / decrease in Inventories", [w[1] for w in wc_rows])
+        row("(Increase) / decrease in Other Current Assets", [w[3] for w in wc_rows])
+        row("Increase / (decrease) in Other Current Liabilities", [w[4] for w in wc_rows])
+        row("Less: Taxes Paid", [-p["tax"] for p in pnl])
+        row("Less: Finance Costs Paid", [-p["finance"] for p in pnl])
+        cfo = []
+        for i, p in enumerate(pnl):
+            v = (p["pbt"] + p["depreciation"] + p["finance"]
+                 + sum(wc_rows[i]) - p["tax"] - p["finance"])
+            cfo.append(v)
+        row("Net Cash from Operations (A)", cfo, total=True)
+
+        # Investing
+        r = ws.max_row + 1
+        ws[f"A{r}"].value = "Cash Flow from Investing Activities"
+        ws[f"A{r}"].font = _font(bold=True, size=10)
+        for col in "ABCD":
+            ws[f"{col}{r}"].fill = _fill(C_SUBHD_BG)
+            ws[f"{col}{r}"].border = _border()
+        capex = [-self.proj.capex_pa] * len(pnl)
+        row("Capital Expenditure (CapEx)", capex)
+        cfi = list(capex)
+        row("Net Cash from Investing (B)", cfi, total=True)
+
+        # Financing
+        r = ws.max_row + 1
+        ws[f"A{r}"].value = "Cash Flow from Financing Activities"
+        ws[f"A{r}"].font = _font(bold=True, size=10)
+        for col in "ABCD":
+            ws[f"{col}{r}"].fill = _fill(C_SUBHD_BG)
+            ws[f"{col}{r}"].border = _border()
+        new_b = [self.proj.new_borrowings_pa] * len(pnl)
+        rep_b = [-self.proj.loan_repayment_pa] * len(pnl)
+        row("New Borrowings", new_b)
+        row("Loan Repayments", rep_b)
+        cff = [n + r_ for n, r_ in zip(new_b, rep_b)]
+        row("Net Cash from Financing (C)", cff, total=True)
+
+        # Net change
+        net_change = [a + b_ + c for a, b_, c in zip(cfo, cfi, cff)]
+        row("Net Change in Cash (A + B + C)", net_change, total=True, bold=True)
+        # Opening cash and closing cash
+        prev_cash = fd.cash_and_bank()
+        opening = []
+        closing = []
+        for nc in net_change:
+            opening.append(prev_cash)
+            prev_cash = prev_cash + nc
+            closing.append(prev_cash)
+        row("Opening Cash & Equivalents", opening)
+        row("Closing Cash & Equivalents", closing, total=True, bold=True)
+
+        ws.freeze_panes = "B3"
+
+    # ── Common-Size statements ───────────────────────────────────────────────
+
+    def _write_common_size(self, pe: "ProjectionEngine | None") -> None:
+        ws = self.wb.create_sheet("Common-Size")
+        fd = self.fd
+        ws.column_dimensions["A"].width = 44
+        for col in "BCDEFG":
+            ws.column_dimensions[col].width = 14
+
+        ws.merge_cells("A1:G1")
+        ws["A1"].value = f"{fd.company.upper()} — COMMON-SIZE STATEMENTS"
+        ws["A1"].font = _font(bold=True, size=12, color=C_WHITE)
+        ws["A1"].fill = _fill(C_HEADER_BG)
+        ws["A1"].alignment = _align("center")
+
+        # P&L common-size (% of revenue)
+        r = 3
+        ws[f"A{r}"].value = "P&L (as % of Revenue)"
+        ws[f"A{r}"].font = _font(bold=True, size=10, color=C_WHITE)
+        ws[f"A{r}"].fill = _fill(C_MID_BLUE)
+        ws.merge_cells(f"A{r}:G{r}")
+        r += 1
+        proj_pnl = pe.projected_pnl() if pe else []
+        years = [fd.period_label] + [f"Year {i+1}" for i in range(len(proj_pnl))]
+        for i, y in enumerate(years):
+            col = chr(ord("B") + i)
+            ws[f"{col}{r}"].value = y
+            ws[f"{col}{r}"].font = _font(bold=True, size=9, color=C_WHITE)
+            ws[f"{col}{r}"].fill = _fill(C_MID_BLUE)
+            ws[f"{col}{r}"].alignment = _align("center")
+            ws[f"{col}{r}"].border = _border()
+        ws[f"A{r}"].value = "Particulars"
+        ws[f"A{r}"].font = _font(bold=True, size=9, color=C_WHITE)
+        ws[f"A{r}"].fill = _fill(C_MID_BLUE)
+        ws[f"A{r}"].border = _border()
+        r += 1
+
+        rev_base = fd.revenue_from_ops() or 1
+        base_pnl_items = [
+            ("Revenue from Operations", fd.revenue_from_ops()),
+            ("Cost of Materials / Purchases", fd.purchases()),
+            ("Employee Benefits", fd.employee_costs()),
+            ("Finance Costs", fd.finance_costs()),
+            ("Depreciation", fd.depreciation_from_fa()),
+            ("Other Expenses", fd.other_indirect_expenses() + fd.direct_expenses()),
+            ("Profit Before Tax", fd.profit_before_tax()),
+            ("Profit After Tax", fd.profit_after_tax()),
+        ]
+        proj_keys = ["revenue", "cogs", "employee", "finance", "depreciation",
+                     "other_expenses", "pbt", "pat"]
+        for (lbl, base_v), key in zip(base_pnl_items, proj_keys):
+            ws[f"A{r}"].value = lbl
+            ws[f"A{r}"].border = _border()
+            ws[f"B{r}"].value = base_v / rev_base
+            ws[f"B{r}"].number_format = "0.0%"
+            ws[f"B{r}"].border = _border()
+            ws[f"B{r}"].alignment = _align("right")
+            for i, p in enumerate(proj_pnl):
+                col = chr(ord("C") + i)
+                ws[f"{col}{r}"].value = p[key] / max(1, p["revenue"])
+                ws[f"{col}{r}"].number_format = "0.0%"
+                ws[f"{col}{r}"].border = _border()
+                ws[f"{col}{r}"].alignment = _align("right")
+            r += 1
+
+        # BS common-size (% of total assets)
+        r += 1
+        ws[f"A{r}"].value = "Balance Sheet (as % of Total Assets)"
+        ws[f"A{r}"].font = _font(bold=True, size=10, color=C_WHITE)
+        ws[f"A{r}"].fill = _fill(C_MID_BLUE)
+        ws.merge_cells(f"A{r}:G{r}")
+        r += 1
+        proj_bs = pe.projected_bs() if pe else []
+        for i, y in enumerate(years):
+            col = chr(ord("B") + i)
+            ws[f"{col}{r}"].value = y
+            ws[f"{col}{r}"].font = _font(bold=True, size=9, color=C_WHITE)
+            ws[f"{col}{r}"].fill = _fill(C_MID_BLUE)
+            ws[f"{col}{r}"].alignment = _align("center")
+            ws[f"{col}{r}"].border = _border()
+        ws[f"A{r}"].value = "Particulars"
+        ws[f"A{r}"].font = _font(bold=True, size=9, color=C_WHITE)
+        ws[f"A{r}"].fill = _fill(C_MID_BLUE)
+        ws[f"A{r}"].border = _border()
+        r += 1
+        ta_base = fd.total_assets() or 1
+        base_bs_items = [
+            ("Shareholders' Funds", fd.total_equity()),
+            ("Long-Term Borrowings", fd.long_term_borrowings()),
+            ("Short-Term Borrowings + Trade Payables",
+             fd.short_term_borrowings() + fd.trade_payables()),
+            ("Fixed Assets (Net)", fd.net_fixed_assets()),
+            ("Inventories", fd.closing_stock()),
+            ("Trade Receivables", fd.trade_receivables()),
+            ("Cash & Equivalents", fd.cash_and_bank()),
+        ]
+        proj_bs_keys = [
+            lambda b: b["total_equity"],
+            lambda b: b["lt_borrowings"],
+            lambda b: b["st_borrowings"] + b["trade_payables"],
+            lambda b: b["fixed_assets"],
+            lambda b: b["inventory"],
+            lambda b: b["debtors"],
+            lambda b: b["cash"],
+        ]
+        for (lbl, base_v), getter in zip(base_bs_items, proj_bs_keys):
+            ws[f"A{r}"].value = lbl
+            ws[f"A{r}"].border = _border()
+            ws[f"B{r}"].value = base_v / ta_base
+            ws[f"B{r}"].number_format = "0.0%"
+            ws[f"B{r}"].border = _border()
+            ws[f"B{r}"].alignment = _align("right")
+            for i, b in enumerate(proj_bs):
+                col = chr(ord("C") + i)
+                ws[f"{col}{r}"].value = getter(b) / max(1, b["total_assets"])
+                ws[f"{col}{r}"].number_format = "0.0%"
+                ws[f"{col}{r}"].border = _border()
+                ws[f"{col}{r}"].alignment = _align("right")
+            r += 1
+
+        ws.freeze_panes = "B3"
+
+    # ── Charts sheet ─────────────────────────────────────────────────────────
+
+    def _write_charts(self, pe: "ProjectionEngine | None") -> None:
+        ws = self.wb.create_sheet("Charts")
+        fd = self.fd
+        ws.column_dimensions["A"].width = 20
+        for col in "BCDE":
+            ws.column_dimensions[col].width = 16
+
+        ws.merge_cells("A1:E1")
+        ws["A1"].value = f"{fd.company.upper()} — KEY CHARTS"
+        ws["A1"].font = _font(bold=True, size=12, color=C_WHITE)
+        ws["A1"].fill = _fill(C_HEADER_BG)
+        ws["A1"].alignment = _align("center")
+
+        # Build a hidden data block for charts
+        if pe:
+            proj_pnl = pe.projected_pnl()
+            years = [fd.period_label] + [f"Year {i+1}" for i in range(len(proj_pnl))]
+            revenue = [fd.revenue_from_ops()] + [p["revenue"] for p in proj_pnl]
+            pat = [fd.profit_after_tax()] + [p["pat"] for p in proj_pnl]
+            ebitda = [fd.profit_before_tax() + fd.finance_costs() + fd.depreciation_from_fa()] \
+                     + [p["ebitda"] for p in proj_pnl]
+            pat_margin = [fd.profit_after_tax() / max(1, fd.revenue_from_ops()) * 100] \
+                         + [p["pat_margin"] for p in proj_pnl]
+        else:
+            years = [fd.period_label]
+            revenue = [fd.revenue_from_ops()]
+            pat = [fd.profit_after_tax()]
+            ebitda = [fd.profit_before_tax() + fd.finance_costs() + fd.depreciation_from_fa()]
+            pat_margin = [fd.profit_after_tax() / max(1, fd.revenue_from_ops()) * 100]
+
+        ws["A3"].value = "Year"
+        for i, y in enumerate(years):
+            ws.cell(row=3, column=2 + i, value=y)
+        ws["A4"].value = "Revenue"
+        for i, v in enumerate(revenue):
+            ws.cell(row=4, column=2 + i, value=v).number_format = INR
+        ws["A5"].value = "EBITDA"
+        for i, v in enumerate(ebitda):
+            ws.cell(row=5, column=2 + i, value=v).number_format = INR
+        ws["A6"].value = "PAT"
+        for i, v in enumerate(pat):
+            ws.cell(row=6, column=2 + i, value=v).number_format = INR
+        ws["A7"].value = "PAT Margin %"
+        for i, v in enumerate(pat_margin):
+            ws.cell(row=7, column=2 + i, value=v / 100).number_format = "0.0%"
+
+        for row_i in range(3, 8):
+            ws[f"A{row_i}"].font = _font(bold=(row_i == 3), size=9)
+            for c in range(2, 2 + len(years)):
+                ws.cell(row=row_i, column=c).alignment = _align("right")
+
+        # Revenue / EBITDA / PAT bar chart
+        ncols = len(years)
+        bar = BarChart()
+        bar.type = "col"
+        bar.style = 12
+        bar.title = "Revenue, EBITDA & PAT"
+        bar.y_axis.title = "₹"
+        bar.x_axis.title = "Year"
+        data = Reference(ws, min_col=1, min_row=4, max_row=6, max_col=1 + ncols)
+        cats = Reference(ws, min_col=2, min_row=3, max_col=1 + ncols, max_row=3)
+        bar.add_data(data, titles_from_data=True)
+        bar.set_categories(cats)
+        bar.height = 9
+        bar.width = 18
+        ws.add_chart(bar, "A10")
+
+        # PAT Margin trend line
+        line = LineChart()
+        line.title = "PAT Margin %"
+        line.y_axis.title = "%"
+        line.style = 12
+        ldata = Reference(ws, min_col=1, min_row=7, max_row=7, max_col=1 + ncols)
+        line.add_data(ldata, titles_from_data=True)
+        line.set_categories(cats)
+        line.height = 9
+        line.width = 18
+        ws.add_chart(line, "A30")
+
 
 # ─── Projection Engine ────────────────────────────────────────────────────────
 
@@ -1860,56 +2409,84 @@ class ProjectionInputs:
     depreciation_rate_pct: float = 15.0 # % WDV
     tax_rate_pct:        float = 25.0   # %
     other_income_pa:     float = 0.0    # ₹ fixed per year
+    simple_mode:         bool  = False  # only use rev_growth_y1/y2/y3, gross_margin_pct, tax_rate_pct
+
+
+@dataclass
+class OutputOptions:
+    """Optional Excel sections — keep the simple-projection output uncluttered by default."""
+    cash_flow:    bool = False
+    ratios:       bool = True
+    charts:       bool = True
+    common_size:  bool = False
+    banker_view:  bool = False  # DSCR, Interest Coverage, Current Ratio in projected sheets
+    page_setup:   bool = True   # fit-to-width on every sheet
 
 
 class ProjectionEngine:
     def __init__(self, fd: FinancialData, p: ProjectionInputs):
         self.fd = fd
         self.p  = p
+        # Apply simple-mode defaults derived from the base year so the projection
+        # is sensible even when the user only set growth/margin/tax.
+        if p.simple_mode:
+            base_rev = fd.revenue_from_ops() or 1
+            # Derive working capital days from the base year for continuity
+            p.inventory_days = round(fd.closing_stock() / max(1, fd.purchases()) * 365) if fd.purchases() else 45
+            p.debtor_days    = round(fd.trade_receivables() / base_rev * 365)
+            p.creditor_days  = round(fd.trade_payables() / max(1, fd.purchases()) * 365) if fd.purchases() else 45
+            p.opex_growth_pct = max(5.0, min(p.rev_growth_y1, p.rev_growth_y2, p.rev_growth_y3))
+            p.depreciation_rate_pct = 15.0
+            p.interest_rate_pct = 12.0
+            # Keep loan_repayment_pa, new_borrowings_pa, capex_pa, other_income_pa at 0
 
     def projected_pnl(self) -> list[dict]:
         fd = self.fd
         p  = self.p
-        base_rev  = fd.revenue_from_ops()
-        base_opex = (fd.employee_costs()
-                     + fd.other_indirect_expenses()
-                     + fd.direct_expenses())
 
         results = []
-        prev_rev = base_rev
-        prev_rev_growth = None
+        prev_rev = fd.revenue_from_ops()
+        prev_lt_borr = fd.long_term_borrowings()
+        prev_net_fa  = fd.net_fixed_assets()
+        prev_inventory = fd.closing_stock()
         growth_rates = [p.rev_growth_y1, p.rev_growth_y2, p.rev_growth_y3]
 
         for yr_idx, g in enumerate(growth_rates):
             rev = prev_rev * (1 + g / 100)
             cogs = rev * (1 - p.gross_margin_pct / 100)
-            stock_change = -(rev / 365 * p.inventory_days - fd.closing_stock()) if yr_idx == 0 else 0
+
+            # Inventory scales every year (was previously frozen after year 0)
+            inventory_close = cogs / 365 * p.inventory_days if cogs else prev_inventory
+            stock_change = -(inventory_close - prev_inventory)  # +ve when stock falls
             gross_profit = rev - cogs + stock_change
 
             opex_mult = (1 + p.opex_growth_pct / 100) ** (yr_idx + 1)
             employee  = fd.employee_costs() * opex_mult
             other_exp = (fd.other_indirect_expenses() + fd.direct_expenses()) * opex_mult
 
-            # Borrowings for interest calculation
-            lt_borr = max(0, fd.long_term_borrowings()
-                          + (p.new_borrowings_pa - p.loan_repayment_pa) * (yr_idx + 1))
-            st_borr = fd.short_term_borrowings()
-            avg_borr = lt_borr + st_borr
-            finance  = avg_borr * p.interest_rate_pct / 100
+            # Borrowings: interest is on the AVERAGE of opening and closing balance
+            lt_close = max(0, prev_lt_borr + p.new_borrowings_pa - p.loan_repayment_pa)
+            avg_lt   = (prev_lt_borr + lt_close) / 2
+            st_borr  = fd.short_term_borrowings()  # held flat unless extended later
+            finance  = (avg_lt + st_borr) * p.interest_rate_pct / 100
 
-            # Depreciation (WDV)
-            if yr_idx == 0:
-                fa_base = fd.net_fixed_assets() + p.capex_pa
-            else:
-                fa_base = results[-1]["net_fa"]
-            depr = fa_base * p.depreciation_rate_pct / 100
-            net_fa = fa_base - depr + p.capex_pa
+            # Depreciation (WDV).  CapEx contributes a half-year of depreciation
+            # in the year it's added (mid-year convention) and is included in the
+            # closing net block exactly once.
+            fa_open  = prev_net_fa
+            depr     = (fa_open + p.capex_pa * 0.5) * p.depreciation_rate_pct / 100
+            net_fa   = fa_open + p.capex_pa - depr
 
             total_exp = cogs + employee + finance + depr + other_exp
-            ebitda    = rev - cogs - employee - other_exp
+            ebitda    = rev - cogs - employee - other_exp + stock_change
             pbt       = rev - total_exp + p.other_income_pa
             tax       = max(0, pbt * p.tax_rate_pct / 100)
             pat       = pbt - tax
+
+            # Banker view: DSCR & Interest Coverage
+            dscr = ((pat + depr + finance)
+                    / (finance + p.loan_repayment_pa)) if (finance + p.loan_repayment_pa) > 0 else None
+            interest_coverage = ((pat + finance + tax) / finance) if finance > 0 else None
 
             results.append({
                 "revenue":          rev,
@@ -1931,8 +2508,15 @@ class ProjectionEngine:
                 "pat":              pat,
                 "pat_margin":       pat / rev * 100 if rev else 0,
                 "net_fa":           net_fa,
+                "lt_borr_close":    lt_close,
+                "inventory_close":  inventory_close,
+                "dscr":             dscr,
+                "interest_coverage": interest_coverage,
             })
-            prev_rev = rev
+            prev_rev       = rev
+            prev_lt_borr   = lt_close
+            prev_net_fa    = net_fa
+            prev_inventory = inventory_close
 
         return results
 
@@ -1943,8 +2527,6 @@ class ProjectionEngine:
 
         bs_list = []
         prev_reserves = fd.reserves_surplus()
-        prev_lt_borr  = fd.long_term_borrowings()
-        prev_fa       = fd.net_fixed_assets()
 
         for yr_idx, yr in enumerate(pnl):
             rev  = yr["revenue"]
@@ -1956,12 +2538,12 @@ class ProjectionEngine:
             share_cap   = fd.share_capital()
             total_equity = share_cap + reserves
 
-            # Borrowings
-            lt_borr = max(0, prev_lt_borr + p.new_borrowings_pa - p.loan_repayment_pa)
+            # Borrowings — use the closing balance computed by the P&L pass
+            lt_borr = yr["lt_borr_close"]
             st_borr = fd.short_term_borrowings()
 
             # Working capital
-            inventory = cogs / 365 * p.inventory_days
+            inventory = yr["inventory_close"]
             debtors   = rev  / 365 * p.debtor_days
             creditors = cogs / 365 * p.creditor_days
 
@@ -1983,7 +2565,16 @@ class ProjectionEngine:
             total_excl_cash = total_nca + inventory + debtors + other_ca
             cash = total_el - total_excl_cash
 
-            total_ca = inventory + debtors + cash + other_ca
+            # If cash plug goes negative the business is short of funding;
+            # surface this so the UI / Validation sheet can flag it.
+            cash_shortfall = max(0, -cash)
+            cash_for_bs   = max(0, cash)
+            if cash_shortfall > 0:
+                # Treat shortfall as additional short-term borrowing needed to balance
+                st_borr += cash_shortfall
+                total_el += cash_shortfall
+
+            total_ca = inventory + debtors + cash_for_bs + other_ca
             total_assets = total_nca + total_ca
 
             bs_list.append({
@@ -2002,14 +2593,17 @@ class ProjectionEngine:
                 "total_nca":      total_nca,
                 "inventory":      inventory,
                 "debtors":        debtors,
-                "cash":           cash,
+                "cash":           cash_for_bs,
                 "other_ca":       other_ca,
                 "total_ca":       total_ca,
                 "total_assets":   total_assets,
+                "cash_shortfall": cash_shortfall,
+                # Banker ratios
+                "current_ratio":  ((inventory + debtors + cash_for_bs + other_ca) /
+                                   (st_borr + creditors + other_cl + provisions))
+                                  if (st_borr + creditors + other_cl + provisions) > 0 else None,
             })
             prev_reserves = reserves
-            prev_lt_borr  = lt_borr
-            prev_fa       = fa
 
         return bs_list
 
@@ -2017,43 +2611,93 @@ class ProjectionEngine:
 # ─── Tkinter UI ───────────────────────────────────────────────────────────────
 
 class App:
+    SETTINGS_PATH = Path.home() / ".tallyfin_settings.json"
+
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Tally Financial Statements Generator")
-        self.root.geometry("780x680")
-        self.root.minsize(700, 600)
+        self.root.geometry("820x760")
+        self.root.minsize(740, 660)
         self.root.configure(bg="#F0F4F8")
 
-        self.db_path     = tk.StringVar()
-        self.out_dir     = tk.StringVar(value=str(Path.home() / "Desktop"))
+        # Restore last-used paths
+        saved = self._load_settings()
+
+        self.db_path     = tk.StringVar(value=saved.get("db_path", ""))
+        self.out_dir     = tk.StringVar(value=saved.get("out_dir",
+                                                       str(Path.home() / "Desktop")))
         self.op_stock    = tk.StringVar()
         self.cl_stock    = tk.StringVar()
         self.status_var  = tk.StringVar(value="Select a Tally SQLite file to begin.")
         self.fd: FinancialData | None = None
         self.reclassify_map: dict[str, str] = {}
-        self._mapping_vars: dict[str, tk.StringVar] = {}  # primary_group → StringVar for dropdown
+        self._mapping_vars: dict[str, tk.StringVar] = {}
+
+        # Projection mode (simple = only 3 inputs; detailed = all 15)
+        self.proj_mode = tk.StringVar(value=saved.get("proj_mode", "simple"))
 
         # Projection inputs
+        defaults = saved.get("proj_inputs", {})
+        def _v(k, d): return tk.StringVar(value=str(defaults.get(k, d)))
         self.proj_vars: dict[str, tk.StringVar] = {
-            "rev_growth_y1":       tk.StringVar(value="15"),
-            "rev_growth_y2":       tk.StringVar(value="15"),
-            "rev_growth_y3":       tk.StringVar(value="10"),
-            "gross_margin_pct":    tk.StringVar(value="30"),
-            "opex_growth_pct":     tk.StringVar(value="10"),
-            "inventory_days":      tk.StringVar(value="45"),
-            "debtor_days":         tk.StringVar(value="60"),
-            "creditor_days":       tk.StringVar(value="45"),
-            "loan_repayment_pa":   tk.StringVar(value="0"),
-            "new_borrowings_pa":   tk.StringVar(value="0"),
-            "interest_rate_pct":   tk.StringVar(value="14"),
-            "capex_pa":            tk.StringVar(value="0"),
-            "depreciation_rate_pct": tk.StringVar(value="15"),
-            "tax_rate_pct":        tk.StringVar(value="25"),
-            "other_income_pa":     tk.StringVar(value="0"),
+            "rev_growth_y1":       _v("rev_growth_y1", "15"),
+            "rev_growth_y2":       _v("rev_growth_y2", "15"),
+            "rev_growth_y3":       _v("rev_growth_y3", "10"),
+            "gross_margin_pct":    _v("gross_margin_pct", "30"),
+            "opex_growth_pct":     _v("opex_growth_pct", "10"),
+            "inventory_days":      _v("inventory_days", "45"),
+            "debtor_days":         _v("debtor_days", "60"),
+            "creditor_days":       _v("creditor_days", "45"),
+            "loan_repayment_pa":   _v("loan_repayment_pa", "0"),
+            "new_borrowings_pa":   _v("new_borrowings_pa", "0"),
+            "interest_rate_pct":   _v("interest_rate_pct", "14"),
+            "capex_pa":            _v("capex_pa", "0"),
+            "depreciation_rate_pct": _v("depreciation_rate_pct", "15"),
+            "tax_rate_pct":        _v("tax_rate_pct", "25"),
+            "other_income_pa":     _v("other_income_pa", "0"),
+        }
+
+        # Output options (which optional Excel sections to include)
+        out_opts = saved.get("output_options", {})
+        self.opt_vars: dict[str, tk.BooleanVar] = {
+            "ratios":      tk.BooleanVar(value=out_opts.get("ratios", True)),
+            "charts":      tk.BooleanVar(value=out_opts.get("charts", True)),
+            "cash_flow":   tk.BooleanVar(value=out_opts.get("cash_flow", False)),
+            "common_size": tk.BooleanVar(value=out_opts.get("common_size", False)),
+            "banker_view": tk.BooleanVar(value=out_opts.get("banker_view", False)),
+            "page_setup":  tk.BooleanVar(value=out_opts.get("page_setup", True)),
         }
 
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
+
+    def _load_settings(self) -> dict:
+        try:
+            import json
+            if self.SETTINGS_PATH.exists():
+                return json.loads(self.SETTINGS_PATH.read_text())
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(self) -> None:
+        try:
+            import json
+            data = {
+                "db_path":  self.db_path.get(),
+                "out_dir":  self.out_dir.get(),
+                "proj_mode": self.proj_mode.get(),
+                "proj_inputs": {k: v.get() for k, v in self.proj_vars.items()},
+                "output_options": {k: v.get() for k, v in self.opt_vars.items()},
+            }
+            self.SETTINGS_PATH.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
+
+    def _on_close(self) -> None:
+        self._save_settings()
+        self.root.destroy()
 
     def _build(self) -> None:
         style = ttk.Style()
@@ -2181,11 +2825,25 @@ class App:
         inner.columnconfigure(1, weight=1)
         inner.columnconfigure(3, weight=1)
 
+        # ── Mode selector (Simple / Detailed) ────────────────────────────────
+        mode_frame = ttk.LabelFrame(inner, text="  Projection Mode", padding=8)
+        mode_frame.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0,10))
+        ttk.Radiobutton(mode_frame, text="Simple  (only 3 inputs — growth, margin, tax)",
+                        variable=self.proj_mode, value="simple",
+                        command=self._refresh_proj_fields).pack(anchor="w")
+        ttk.Radiobutton(mode_frame, text="Detailed  (all 15 banker-grade inputs)",
+                        variable=self.proj_mode, value="detailed",
+                        command=self._refresh_proj_fields).pack(anchor="w")
+
+        simple_keys = {"rev_growth_y1", "rev_growth_y2", "rev_growth_y3",
+                       "gross_margin_pct", "tax_rate_pct"}
+
         fields = [
             ("Revenue Growth – Year 1 (%)",            "rev_growth_y1"),
             ("Revenue Growth – Year 2 (%)",            "rev_growth_y2"),
             ("Revenue Growth – Year 3 (%)",            "rev_growth_y3"),
             ("Gross Margin % (Revenue − COGS)",        "gross_margin_pct"),
+            ("Effective Tax Rate (%)",                  "tax_rate_pct"),
             ("Operating Expense Growth (% per year)",  "opex_growth_pct"),
             ("Inventory Days (Stock / COGS × 365)",    "inventory_days"),
             ("Debtor Days (Receivables / Rev × 365)",  "debtor_days"),
@@ -2195,7 +2853,6 @@ class App:
             ("Interest Rate on Borrowings (%)",        "interest_rate_pct"),
             ("Capital Expenditure per Year (₹)",       "capex_pa"),
             ("Depreciation Rate – WDV (%)",            "depreciation_rate_pct"),
-            ("Effective Tax Rate (%)",                  "tax_rate_pct"),
             ("Other / Fixed Income per Year (₹)",      "other_income_pa"),
         ]
 
@@ -2209,37 +2866,82 @@ class App:
             "tax_rate_pct":      "Effective corporate tax rate (base rate 22% + surcharge ≈ 25.17%)",
         }
 
+        # Track field widgets so we can grey them out in Simple mode
+        self._proj_field_widgets: list[tuple[str, ttk.Label, ttk.Entry]] = []
+        start_row = 1   # row 0 is mode_frame
         for i, (label, key) in enumerate(fields):
-            row_i = i // 2
+            row_i = start_row + i // 2
             col_base = (i % 2) * 2
-            ttk.Label(inner, text=label, font=("Calibri", 9)).grid(
-                row=row_i, column=col_base, sticky="w", padx=(0,8), pady=4)
+            lbl = ttk.Label(inner, text=label, font=("Calibri", 9))
+            lbl.grid(row=row_i, column=col_base, sticky="w", padx=(0,8), pady=4)
             e = ttk.Entry(inner, textvariable=self.proj_vars[key], width=14)
             e.grid(row=row_i, column=col_base + 1, sticky="ew", pady=4)
             if key in hints:
                 e.bind("<FocusIn>", lambda ev, h=hints[key]: self._set_status(h))
+            self._proj_field_widgets.append((key, lbl, e))
+        self._simple_keys = simple_keys
 
-        hint_r = len(fields) // 2 + 1
+        # ── Output Options ───────────────────────────────────────────────────
+        opt_r = start_row + (len(fields) + 1) // 2 + 1
+        opt_frame = ttk.LabelFrame(inner, text="  Optional Excel Sheets", padding=8)
+        opt_frame.grid(row=opt_r, column=0, columnspan=4, sticky="ew", pady=(10,4))
+        for col_i in range(3):
+            opt_frame.columnconfigure(col_i, weight=1)
+        opts_layout = [
+            ("ratios",      "📊  Ratios sheet",
+             "Liquidity, leverage, profitability, efficiency days"),
+            ("charts",      "📈  Charts (Revenue / EBITDA / PAT / Margin)",
+             "Bar + line charts on a dedicated sheet"),
+            ("cash_flow",   "💰  Cash Flow Statement (Projected)",
+             "Indirect method, 3-year"),
+            ("common_size", "📋  Common-Size statements",
+             "P&L as % of revenue · BS as % of total assets"),
+            ("banker_view", "🏦  Banker view (DSCR + Interest Coverage)",
+             "Add bank-style coverage rows to the Projected P&L"),
+            ("page_setup",  "🖨  Print-ready page setup (fit to width)",
+             "A4 page setup with header/footer for every sheet"),
+        ]
+        for i, (key, lbl, hint) in enumerate(opts_layout):
+            cb = ttk.Checkbutton(opt_frame, text=lbl, variable=self.opt_vars[key])
+            cb.grid(row=i, column=0, sticky="w", padx=(0,8), pady=2)
+            ttk.Label(opt_frame, text=hint, foreground="#666",
+                      font=("Calibri", 8)).grid(row=i, column=1, sticky="w")
+
+        # ── Guidance ─────────────────────────────────────────────────────────
+        hint_r = opt_r + 1
         hint_box = tk.Text(inner, height=5, font=("Calibri", 9), bg="#FFF9E6",
                            relief="flat", wrap="word", borderwidth=1)
         hint_box.insert("1.0",
             "GUIDANCE:\n"
-            "• Gross Margin: for a trading company like Fortius, typical is 20–35%.\n"
-            "• Debtor Days: if your debtors turn over in 60 days, enter 60.\n"
-            "• Creditor Days: industry avg for electronics trading ≈ 30–45 days.\n"
-            "• New Borrowings / Repayments: enter absolute ₹ values per year.\n"
-            "• Leave CapEx at 0 if no new investments planned.\n"
-            "• The projected Balance Sheet uses a cash plug to balance automatically.")
+            "• Simple mode: only revenue growth, gross margin and tax rate matter. "
+            "Working-capital days, OpEx growth and interest rate are derived from base year.\n"
+            "• Detailed mode: full banker model — tune every lever.\n"
+            "• Tick optional sheets only when you need them — keeps the file lean.\n"
+            "• If projected cash plug goes negative the BS shows the funding shortfall in red.")
         hint_box.config(state="disabled")
         hint_box.grid(row=hint_r, column=0, columnspan=4, sticky="ew",
                       pady=(12,8), padx=4)
 
         btn_frame = ttk.Frame(inner)
         btn_frame.grid(row=hint_r + 1, column=0, columnspan=4, sticky="e", pady=8)
-        ttk.Button(btn_frame, text="Generate Projected Statements + Actual (All Sheets)",
+        ttk.Button(btn_frame, text="Generate Projected + Actual (All Sheets)",
                    command=self._gen_all, style="Accent.TButton").pack(side="right")
         ttk.Button(btn_frame, text="Projections Only",
                    command=self._gen_proj_only, style="TButton").pack(side="right", padx=(0,8))
+
+        # Apply initial enable/disable state for fields
+        self._refresh_proj_fields()
+
+    def _refresh_proj_fields(self) -> None:
+        """Grey out detailed-mode fields when Simple mode is selected."""
+        is_simple = self.proj_mode.get() == "simple"
+        for key, lbl, entry in getattr(self, "_proj_field_widgets", []):
+            if is_simple and key not in self._simple_keys:
+                entry.state(["disabled"])
+                lbl.configure(foreground="#999")
+            else:
+                entry.state(["!disabled"])
+                lbl.configure(foreground="")
 
     def _build_validation_tab(self) -> None:
         tab = ttk.Frame(self.nb, padding=8)
@@ -2529,14 +3231,19 @@ class App:
 
     def _get_proj_inputs(self) -> ProjectionInputs | None:
         try:
-            return ProjectionInputs(**{
+            p = ProjectionInputs(**{
                 k: float(v.get().replace(",",""))
                 for k, v in self.proj_vars.items()
             })
+            p.simple_mode = (self.proj_mode.get() == "simple")
+            return p
         except ValueError as e:
             messagebox.showerror("Invalid Input",
                                  f"Please enter valid numbers in the projection fields.\n{e}")
             return None
+
+    def _get_output_options(self) -> "OutputOptions":
+        return OutputOptions(**{k: v.get() for k, v in self.opt_vars.items()})
 
     def _output_path(self, suffix="") -> str:
         fd = self.fd
@@ -2551,7 +3258,8 @@ class App:
             return
         out = self._output_path("_Actual")
         try:
-            ExcelWriter(fd, proj=None).save(out)
+            ExcelWriter(fd, proj=None, opts=self._get_output_options()).save(out)
+            self._save_settings()
             self._set_status(f"Saved: {out}")
             if messagebox.askyesno("Done", f"Excel saved:\n{out}\n\nOpen it now?"):
                 os.startfile(out) if os.name == "nt" else os.system(f'open "{out}"')
@@ -2567,7 +3275,8 @@ class App:
             return
         out = self._output_path("_Projected")
         try:
-            ExcelWriter(fd, proj).save(out)
+            ExcelWriter(fd, proj, opts=self._get_output_options()).save(out)
+            self._save_settings()
             self._set_status(f"Saved: {out}")
             if messagebox.askyesno("Done", f"Excel saved:\n{out}\n\nOpen it now?"):
                 os.startfile(out) if os.name == "nt" else os.system(f'open "{out}"')
@@ -2583,7 +3292,8 @@ class App:
             return
         out = self._output_path("_Full")
         try:
-            ExcelWriter(fd, proj).save(out)
+            ExcelWriter(fd, proj, opts=self._get_output_options()).save(out)
+            self._save_settings()
             self._set_status(f"Saved: {out}")
             if messagebox.askyesno("Done", f"Excel saved:\n{out}\n\nOpen it now?"):
                 os.startfile(out) if os.name == "nt" else os.system(f'open "{out}"')
