@@ -1,0 +1,16 @@
+# Virtual environment (created by launchers — never commit)
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS metadata
+.DS_Store
+
+# Windows thumbnail cache
+Thumbs.db
+
+# Output files (generated Excel — don't commit)
+*.xlsx
