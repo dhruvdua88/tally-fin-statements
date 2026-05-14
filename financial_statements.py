@@ -1098,6 +1098,13 @@ class ExcelWriter:
                 ws[f"C{r}"].number_format = fmt
                 ws[f"C{r}"].font = _font(bold=bold or total, size=10)
                 ws[f"C{r}"].alignment = _align("right")
+            # Always ensure the amount cell has the right format/alignment/weight,
+            # even on total rows whose formula is filled in by the caller after row().
+            ws[f"C{r}"].number_format = fmt
+            ws[f"C{r}"].alignment = _align("right")
+            if bold or total:
+                ws[f"A{r}"].font = _font(bold=True, size=10)
+                ws[f"C{r}"].font = _font(bold=True, size=10)
             # Light borders on every data row for a clean tabular look
             for col in "ABCD":
                 ws[f"{col}{r}"].border = _border()
