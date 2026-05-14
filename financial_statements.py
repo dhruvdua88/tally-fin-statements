@@ -13,6 +13,11 @@ import os
 import sqlite3
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+try:
+    import customtkinter as ctk
+    _HAS_CTK = True
+except ImportError:
+    _HAS_CTK = False
 from pathlib import Path
 from datetime import date
 from dataclasses import dataclass, field
@@ -2614,14 +2619,24 @@ class App:
     SETTINGS_PATH = Path.home() / ".tallyfin_settings.json"
 
     def __init__(self) -> None:
-        self.root = tk.Tk()
-        self.root.title("Tally Financial Statements Generator")
-        self.root.geometry("820x760")
-        self.root.minsize(740, 660)
-        self.root.configure(bg="#F0F4F8")
+        if not _HAS_CTK:
+            messagebox.showerror(
+                "Missing dependency",
+                "customtkinter is not installed.\n\n"
+                "Run: pip install customtkinter\n"
+                "or re-run the launcher script (run_windows.bat / run_mac.command) "
+                "which installs it automatically.")
+            raise SystemExit(1)
 
-        # Restore last-used paths
+        # Theme: light by default; user can flip via toggle in title bar
         saved = self._load_settings()
+        ctk.set_appearance_mode(saved.get("appearance_mode", "light"))
+        ctk.set_default_color_theme("blue")
+
+        self.root = ctk.CTk()
+        self.root.title("Tally Financial Statements Generator")
+        self.root.geometry("900x820")
+        self.root.minsize(820, 720)
 
         self.db_path     = tk.StringVar(value=saved.get("db_path", ""))
         self.out_dir     = tk.StringVar(value=saved.get("out_dir",
@@ -2690,150 +2705,171 @@ class App:
                 "proj_mode": self.proj_mode.get(),
                 "proj_inputs": {k: v.get() for k, v in self.proj_vars.items()},
                 "output_options": {k: v.get() for k, v in self.opt_vars.items()},
+                "appearance_mode": ctk.get_appearance_mode().lower(),
             }
             self.SETTINGS_PATH.write_text(json.dumps(data, indent=2))
         except Exception:
             pass
+
+    def _toggle_appearance(self) -> None:
+        new_mode = "dark" if ctk.get_appearance_mode().lower() == "light" else "light"
+        ctk.set_appearance_mode(new_mode)
+        if hasattr(self, "_theme_btn"):
+            self._theme_btn.configure(text="☀  Light" if new_mode == "dark" else "🌙  Dark")
 
     def _on_close(self) -> None:
         self._save_settings()
         self.root.destroy()
 
     def _build(self) -> None:
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TNotebook",        background="#F0F4F8")
-        style.configure("TNotebook.Tab",    padding=[12, 6], font=("Calibri", 10, "bold"))
-        style.configure("TFrame",           background="#F0F4F8")
-        style.configure("TLabel",           background="#F0F4F8", font=("Calibri", 10))
-        style.configure("TButton",          font=("Calibri", 10, "bold"), padding=6)
-        style.configure("Accent.TButton",   font=("Calibri", 11, "bold"), padding=8)
-        style.configure("TEntry",           font=("Calibri", 10))
-        style.configure("TLabelframe",      background="#F0F4F8",
-                         font=("Calibri", 10, "bold"))
-        style.configure("TLabelframe.Label",background="#F0F4F8",
-                         font=("Calibri", 10, "bold"))
-
         # ── Title bar ────────────────────────────────────────────────────────
-        title_frame = tk.Frame(self.root, bg="#1F3864", pady=14)
+        title_frame = ctk.CTkFrame(self.root, fg_color="#1F3864", corner_radius=0, height=78)
         title_frame.pack(fill="x")
-        tk.Label(title_frame,
-                 text="Tally Financial Statements Generator",
-                 bg="#1F3864", fg="white",
-                 font=("Calibri", 15, "bold")).pack()
-        tk.Label(title_frame,
-                 text="Schedule III Balance Sheet  •  P&L  •  3-Year Projections",
-                 bg="#1F3864", fg="#BDD7EE",
-                 font=("Calibri", 10)).pack()
+        title_frame.pack_propagate(False)
+        ctk.CTkLabel(title_frame, text="Tally Financial Statements Generator",
+                     font=ctk.CTkFont(family="Calibri", size=18, weight="bold"),
+                     text_color="white").pack(pady=(10, 0))
+        ctk.CTkLabel(title_frame,
+                     text="Schedule III Balance Sheet  •  P&L  •  3-Year Projections",
+                     font=ctk.CTkFont(family="Calibri", size=11),
+                     text_color="#BDD7EE").pack()
 
-        main = ttk.Frame(self.root, padding=16)
-        main.pack(fill="both", expand=True)
+        # Dark/light toggle in top-right corner of the title bar
+        is_dark = ctk.get_appearance_mode().lower() == "dark"
+        self._theme_btn = ctk.CTkButton(title_frame, width=88, height=26,
+            text="☀  Light" if is_dark else "🌙  Dark",
+            command=self._toggle_appearance,
+            fg_color="#2F5496", hover_color="#4472C4",
+            text_color="white", corner_radius=6,
+            font=ctk.CTkFont(size=10, weight="bold"))
+        self._theme_btn.place(relx=1.0, x=-14, y=14, anchor="ne")
+
+        main = ctk.CTkFrame(self.root, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=(12, 12))
 
         # ── File selection ────────────────────────────────────────────────────
-        file_frame = ttk.LabelFrame(main, text="  Database File", padding=10)
+        file_frame = ctk.CTkFrame(main, corner_radius=10)
         file_frame.pack(fill="x", pady=(0, 10))
         file_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(file_frame, text="Tally SQLite:").grid(row=0, column=0, sticky="w", padx=(0,8))
-        ttk.Entry(file_frame, textvariable=self.db_path, width=55).grid(row=0, column=1, sticky="ew")
-        ttk.Button(file_frame, text="Browse…", command=self._pick_db).grid(row=0, column=2, padx=(8,0))
+        ctk.CTkLabel(file_frame, text="  Database File",
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 2))
 
-        ttk.Label(file_frame, text="Output Folder:").grid(row=1, column=0, sticky="w", padx=(0,8), pady=(6,0))
-        ttk.Entry(file_frame, textvariable=self.out_dir, width=55).grid(row=1, column=1, sticky="ew", pady=(6,0))
-        ttk.Button(file_frame, text="Browse…", command=self._pick_outdir).grid(row=1, column=2, padx=(8,0), pady=(6,0))
+        ctk.CTkLabel(file_frame, text="Tally SQLite:").grid(
+            row=1, column=0, sticky="w", padx=(14, 8), pady=4)
+        ctk.CTkEntry(file_frame, textvariable=self.db_path, width=500).grid(
+            row=1, column=1, sticky="ew", pady=4)
+        ctk.CTkButton(file_frame, text="Browse…", width=88,
+                      command=self._pick_db).grid(row=1, column=2, padx=(8, 14), pady=4)
+
+        ctk.CTkLabel(file_frame, text="Output Folder:").grid(
+            row=2, column=0, sticky="w", padx=(14, 8), pady=(4, 10))
+        ctk.CTkEntry(file_frame, textvariable=self.out_dir, width=500).grid(
+            row=2, column=1, sticky="ew", pady=(4, 10))
+        ctk.CTkButton(file_frame, text="Browse…", width=88,
+                      command=self._pick_outdir).grid(
+            row=2, column=2, padx=(8, 14), pady=(4, 10))
 
         # ── Tabs ─────────────────────────────────────────────────────────────
-        self.nb = ttk.Notebook(main)
-        self.nb.pack(fill="both", expand=True, pady=(0,10))
+        self.nb = ctk.CTkTabview(main, corner_radius=10,
+                                  segmented_button_selected_color="#1F3864",
+                                  segmented_button_selected_hover_color="#2F5496")
+        self.nb.pack(fill="both", expand=True, pady=(0, 10))
+        self.nb.add("Actual Statements")
+        self.nb.add("3-Year Projections")
+        self.nb.add("Validation")
+        self.nb.add("Group Mapping")
 
-        self._build_actual_tab()
-        self._build_proj_tab()
-        self._build_validation_tab()
-        self._build_mapping_tab()
+        self._build_actual_tab(self.nb.tab("Actual Statements"))
+        self._build_proj_tab(self.nb.tab("3-Year Projections"))
+        self._build_validation_tab(self.nb.tab("Validation"))
+        self._build_mapping_tab(self.nb.tab("Group Mapping"))
 
         # ── Status + action ───────────────────────────────────────────────────
-        bottom = ttk.Frame(main)
+        bottom = ctk.CTkFrame(main, fg_color="transparent")
         bottom.pack(fill="x")
-        self.status_lbl = ttk.Label(bottom, textvariable=self.status_var,
-                                    foreground="#2F5496")
+        self.status_lbl = ctk.CTkLabel(bottom, textvariable=self.status_var,
+                                        text_color="#2F5496",
+                                        font=ctk.CTkFont(size=10),
+                                        anchor="w")
         self.status_lbl.pack(side="left", fill="x", expand=True)
-        ttk.Button(bottom, text="❌ Clear", command=self._clear,
-                   style="TButton").pack(side="right", padx=(8,0))
+        ctk.CTkButton(bottom, text="✕  Clear", width=92,
+                      command=self._clear,
+                      fg_color="#888", hover_color="#666").pack(side="right", padx=(8, 0))
 
-    def _build_actual_tab(self) -> None:
-        tab = ttk.Frame(self.nb, padding=12)
-        self.nb.add(tab, text="Actual Statements")
-        tab.columnconfigure(1, weight=1)
-
-        # Stock adjustments
-        stock_frame = ttk.LabelFrame(tab, text="  Stock Values", padding=10)
-        stock_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,12))
-        stock_frame.columnconfigure(1, weight=1)
-
-        help_text = ("Tally's 'Closing Stock' ledger holds accounting-entry stock values.\n"
-                     "Enter corrected values below if they differ from the audit trial balance.\n"
-                     "Leave blank to use Tally's own figures.")
-        ttk.Label(stock_frame, text=help_text, foreground="#595959",
-                  font=("Calibri", 9)).grid(row=0, column=0, columnspan=3,
-                                             sticky="w", pady=(0,8))
-
-        ttk.Label(stock_frame, text="Opening Stock (₹):").grid(row=1, column=0, sticky="w", padx=(0,10))
-        self.op_entry = ttk.Entry(stock_frame, textvariable=self.op_stock, width=20)
-        self.op_entry.grid(row=1, column=1, sticky="w")
-        ttk.Label(stock_frame, text="(from Tally if blank)",
-                  foreground="#888", font=("Calibri",9)).grid(row=1, column=2, sticky="w", padx=8)
-
-        ttk.Label(stock_frame, text="Closing Stock (₹):").grid(row=2, column=0, sticky="w", padx=(0,10), pady=(6,0))
-        self.cl_entry = ttk.Entry(stock_frame, textvariable=self.cl_stock, width=20)
-        self.cl_entry.grid(row=2, column=1, sticky="w", pady=(6,0))
-        ttk.Label(stock_frame, text="(from Tally if blank)",
-                  foreground="#888", font=("Calibri",9)).grid(row=2, column=2, sticky="w", padx=8, pady=(6,0))
-
-        ttk.Button(stock_frame, text="Apply & Preview Numbers",
-                   command=self._preview_actual).grid(row=3, column=0, columnspan=3,
-                                                       pady=(10,0), sticky="w")
-
-        # Preview panel
-        self.preview_text = tk.Text(tab, height=16, width=72, font=("Courier", 9),
-                                    bg="#FAFAFA", relief="flat", borderwidth=1)
-        self.preview_text.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0,8))
+    def _build_actual_tab(self, tab) -> None:
+        tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
 
-        btn_frame = ttk.Frame(tab)
-        btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
-        ttk.Button(btn_frame, text="Generate Actual Statements (Excel)",
-                   command=self._gen_actual, style="Accent.TButton").pack(side="right")
+        # Stock adjustments
+        stock_frame = ctk.CTkFrame(tab, corner_radius=10)
+        stock_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(8, 12))
+        stock_frame.columnconfigure(1, weight=1)
 
-    def _build_proj_tab(self) -> None:
-        tab = ttk.Frame(self.nb, padding=12)
-        self.nb.add(tab, text="3-Year Projections")
+        ctk.CTkLabel(stock_frame, text="  Stock Values",
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 2))
 
-        canvas = tk.Canvas(tab, bg="#F0F4F8", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        inner = ttk.Frame(canvas, padding=8)
-        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        help_text = ("Tally's 'Closing Stock' ledger holds accounting-entry stock values. "
+                     "Enter corrected values below if they differ from the audit trial balance. "
+                     "Leave blank to use Tally's own figures.")
+        ctk.CTkLabel(stock_frame, text=help_text, text_color="gray50",
+                     font=ctk.CTkFont(size=10), wraplength=720,
+                     justify="left", anchor="w").grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 8))
 
-        def _on_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(canvas_window, width=event.width if event.width > 1 else canvas.winfo_width())
-        inner.bind("<Configure>", _on_configure)
-        canvas.bind("<Configure>", _on_configure)
+        ctk.CTkLabel(stock_frame, text="Opening Stock (₹):").grid(
+            row=2, column=0, sticky="w", padx=(14, 10), pady=4)
+        self.op_entry = ctk.CTkEntry(stock_frame, textvariable=self.op_stock, width=200,
+                                      placeholder_text="from Tally if blank")
+        self.op_entry.grid(row=2, column=1, sticky="w", pady=4)
 
-        inner.columnconfigure(1, weight=1)
-        inner.columnconfigure(3, weight=1)
+        ctk.CTkLabel(stock_frame, text="Closing Stock (₹):").grid(
+            row=3, column=0, sticky="w", padx=(14, 10), pady=4)
+        self.cl_entry = ctk.CTkEntry(stock_frame, textvariable=self.cl_stock, width=200,
+                                      placeholder_text="from Tally if blank")
+        self.cl_entry.grid(row=3, column=1, sticky="w", pady=4)
+
+        ctk.CTkButton(stock_frame, text="Apply & Preview Numbers", width=200,
+                      command=self._preview_actual).grid(
+            row=4, column=0, columnspan=2, padx=14, pady=(10, 12), sticky="w")
+
+        # Preview panel (monospace, scrollable)
+        self.preview_text = ctk.CTkTextbox(tab,
+            font=ctk.CTkFont(family="Courier", size=10),
+            corner_radius=10, wrap="none")
+        self.preview_text.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
+        self.preview_text.configure(state="disabled")
+
+        btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, sticky="ew", padx=4)
+        ctk.CTkButton(btn_frame, text="Generate Actual Statements (Excel)",
+                      command=self._gen_actual, height=36,
+                      font=ctk.CTkFont(size=12, weight="bold"),
+                      fg_color="#1F3864", hover_color="#2F5496").pack(side="right")
+
+    def _build_proj_tab(self, tab) -> None:
+        # CTkScrollableFrame replaces the canvas+scrollbar+inner workaround
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=4, pady=8)
+        scroll.columnconfigure(1, weight=1)
+        scroll.columnconfigure(3, weight=1)
 
         # ── Mode selector (Simple / Detailed) ────────────────────────────────
-        mode_frame = ttk.LabelFrame(inner, text="  Projection Mode", padding=8)
-        mode_frame.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0,10))
-        ttk.Radiobutton(mode_frame, text="Simple  (only 3 inputs — growth, margin, tax)",
-                        variable=self.proj_mode, value="simple",
-                        command=self._refresh_proj_fields).pack(anchor="w")
-        ttk.Radiobutton(mode_frame, text="Detailed  (all 15 banker-grade inputs)",
-                        variable=self.proj_mode, value="detailed",
-                        command=self._refresh_proj_fields).pack(anchor="w")
+        mode_frame = ctk.CTkFrame(scroll, corner_radius=10)
+        mode_frame.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        ctk.CTkLabel(mode_frame, text="  Projection Mode",
+                     font=ctk.CTkFont(size=11, weight="bold")).pack(
+            anchor="w", padx=12, pady=(8, 2))
+        ctk.CTkRadioButton(mode_frame,
+            text="Simple — only 3 inputs (revenue growth · gross margin · tax)",
+            variable=self.proj_mode, value="simple",
+            command=self._refresh_proj_fields).pack(anchor="w", padx=14, pady=2)
+        ctk.CTkRadioButton(mode_frame,
+            text="Detailed — all 15 banker-grade inputs",
+            variable=self.proj_mode, value="detailed",
+            command=self._refresh_proj_fields).pack(anchor="w", padx=14, pady=(2, 10))
 
         simple_keys = {"rev_growth_y1", "rev_growth_y2", "rev_growth_y3",
                        "gross_margin_pct", "tax_rate_pct"}
@@ -2866,27 +2902,41 @@ class App:
             "tax_rate_pct":      "Effective corporate tax rate (base rate 22% + surcharge ≈ 25.17%)",
         }
 
-        # Track field widgets so we can grey them out in Simple mode
-        self._proj_field_widgets: list[tuple[str, ttk.Label, ttk.Entry]] = []
-        start_row = 1   # row 0 is mode_frame
+        # Group fields in a CTk frame for visual cohesion
+        fields_frame = ctk.CTkFrame(scroll, corner_radius=10)
+        fields_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        fields_frame.columnconfigure(1, weight=1)
+        fields_frame.columnconfigure(3, weight=1)
+        ctk.CTkLabel(fields_frame, text="  Projection Inputs",
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4))
+
+        self._proj_field_widgets: list = []
         for i, (label, key) in enumerate(fields):
-            row_i = start_row + i // 2
+            row_i = 1 + i // 2
             col_base = (i % 2) * 2
-            lbl = ttk.Label(inner, text=label, font=("Calibri", 9))
-            lbl.grid(row=row_i, column=col_base, sticky="w", padx=(0,8), pady=4)
-            e = ttk.Entry(inner, textvariable=self.proj_vars[key], width=14)
-            e.grid(row=row_i, column=col_base + 1, sticky="ew", pady=4)
+            lbl = ctk.CTkLabel(fields_frame, text=label,
+                                font=ctk.CTkFont(size=10), anchor="w")
+            lbl.grid(row=row_i, column=col_base, sticky="w",
+                     padx=(14, 8) if col_base == 0 else (8, 8), pady=3)
+            e = ctk.CTkEntry(fields_frame, textvariable=self.proj_vars[key], width=120)
+            e.grid(row=row_i, column=col_base + 1, sticky="w",
+                   padx=(0, 14) if col_base == 2 else (0, 8), pady=3)
             if key in hints:
                 e.bind("<FocusIn>", lambda ev, h=hints[key]: self._set_status(h))
             self._proj_field_widgets.append((key, lbl, e))
+        # Bottom padding inside fields_frame
+        ctk.CTkLabel(fields_frame, text="").grid(row=99, column=0, pady=(2, 6))
         self._simple_keys = simple_keys
 
         # ── Output Options ───────────────────────────────────────────────────
-        opt_r = start_row + (len(fields) + 1) // 2 + 1
-        opt_frame = ttk.LabelFrame(inner, text="  Optional Excel Sheets", padding=8)
-        opt_frame.grid(row=opt_r, column=0, columnspan=4, sticky="ew", pady=(10,4))
-        for col_i in range(3):
-            opt_frame.columnconfigure(col_i, weight=1)
+        opt_frame = ctk.CTkFrame(scroll, corner_radius=10)
+        opt_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        opt_frame.columnconfigure(0, weight=1)
+        opt_frame.columnconfigure(1, weight=2)
+        ctk.CTkLabel(opt_frame, text="  Optional Excel Sheets",
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 4))
         opts_layout = [
             ("ratios",      "📊  Ratios sheet",
              "Liquidity, leverage, profitability, efficiency days"),
@@ -2902,32 +2952,40 @@ class App:
              "A4 page setup with header/footer for every sheet"),
         ]
         for i, (key, lbl, hint) in enumerate(opts_layout):
-            cb = ttk.Checkbutton(opt_frame, text=lbl, variable=self.opt_vars[key])
-            cb.grid(row=i, column=0, sticky="w", padx=(0,8), pady=2)
-            ttk.Label(opt_frame, text=hint, foreground="#666",
-                      font=("Calibri", 8)).grid(row=i, column=1, sticky="w")
+            ctk.CTkCheckBox(opt_frame, text=lbl, variable=self.opt_vars[key],
+                            font=ctk.CTkFont(size=10)).grid(
+                row=i + 1, column=0, sticky="w", padx=(14, 8), pady=3)
+            ctk.CTkLabel(opt_frame, text=hint, text_color="gray50",
+                          font=ctk.CTkFont(size=9), anchor="w").grid(
+                row=i + 1, column=1, sticky="w", pady=3, padx=(0, 14))
+        ctk.CTkLabel(opt_frame, text="").grid(row=99, column=0, pady=(0, 6))
 
         # ── Guidance ─────────────────────────────────────────────────────────
-        hint_r = opt_r + 1
-        hint_box = tk.Text(inner, height=5, font=("Calibri", 9), bg="#FFF9E6",
-                           relief="flat", wrap="word", borderwidth=1)
-        hint_box.insert("1.0",
-            "GUIDANCE:\n"
-            "• Simple mode: only revenue growth, gross margin and tax rate matter. "
-            "Working-capital days, OpEx growth and interest rate are derived from base year.\n"
-            "• Detailed mode: full banker model — tune every lever.\n"
-            "• Tick optional sheets only when you need them — keeps the file lean.\n"
-            "• If projected cash plug goes negative the BS shows the funding shortfall in red.")
-        hint_box.config(state="disabled")
-        hint_box.grid(row=hint_r, column=0, columnspan=4, sticky="ew",
-                      pady=(12,8), padx=4)
+        hint_frame = ctk.CTkFrame(scroll, fg_color="#FFF6D5", corner_radius=10)
+        hint_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        ctk.CTkLabel(hint_frame,
+            text=(
+                "GUIDANCE\n"
+                "• Simple mode: only revenue growth, gross margin and tax rate matter. "
+                "Working-capital days, OpEx growth and interest rate are derived from base year.\n"
+                "• Detailed mode: full banker model — tune every lever.\n"
+                "• Tick optional sheets only when you need them — keeps the file lean.\n"
+                "• If projected cash plug goes negative, the BS shows the funding shortfall in red."),
+            text_color="#7B5800", font=ctk.CTkFont(size=10),
+            wraplength=820, justify="left", anchor="w").pack(
+            anchor="w", padx=14, pady=10, fill="x")
 
-        btn_frame = ttk.Frame(inner)
-        btn_frame.grid(row=hint_r + 1, column=0, columnspan=4, sticky="e", pady=8)
-        ttk.Button(btn_frame, text="Generate Projected + Actual (All Sheets)",
-                   command=self._gen_all, style="Accent.TButton").pack(side="right")
-        ttk.Button(btn_frame, text="Projections Only",
-                   command=self._gen_proj_only, style="TButton").pack(side="right", padx=(0,8))
+        # ── Action buttons ───────────────────────────────────────────────────
+        btn_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_frame.grid(row=4, column=0, columnspan=4, sticky="e", pady=(4, 12))
+        ctk.CTkButton(btn_frame, text="Projections Only", width=160,
+                      command=self._gen_proj_only,
+                      fg_color="#888", hover_color="#666").pack(side="right", padx=(0, 0))
+        ctk.CTkButton(btn_frame, text="Generate Projected + Actual (All Sheets)",
+                      width=320, height=36, command=self._gen_all,
+                      font=ctk.CTkFont(size=12, weight="bold"),
+                      fg_color="#1F3864", hover_color="#2F5496").pack(
+            side="right", padx=(0, 8))
 
         # Apply initial enable/disable state for fields
         self._refresh_proj_fields()
@@ -2937,89 +2995,94 @@ class App:
         is_simple = self.proj_mode.get() == "simple"
         for key, lbl, entry in getattr(self, "_proj_field_widgets", []):
             if is_simple and key not in self._simple_keys:
-                entry.state(["disabled"])
-                lbl.configure(foreground="#999")
+                entry.configure(state="disabled")
+                lbl.configure(text_color="gray60")
             else:
-                entry.state(["!disabled"])
-                lbl.configure(foreground="")
+                entry.configure(state="normal")
+                lbl.configure(text_color=("gray10", "gray90"))
 
-    def _build_validation_tab(self) -> None:
-        tab = ttk.Frame(self.nb, padding=8)
-        self.nb.add(tab, text="Validation")
+    def _build_validation_tab(self, tab) -> None:
         tab.rowconfigure(1, weight=1)
         tab.columnconfigure(0, weight=1)
 
-        top = ttk.Frame(tab)
-        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        self.val_summary = ttk.Label(top,
+        top = ctk.CTkFrame(tab, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=4, pady=(8, 6))
+        self.val_summary = ctk.CTkLabel(top,
             text="Load a database file to see validation results.",
-            font=("Calibri", 10, "bold"), foreground="#2F5496")
-        self.val_summary.pack(side="left")
-        ttk.Button(top, text="Re-run Validation",
-                   command=self._run_validation).pack(side="right")
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#2F5496", anchor="w")
+        self.val_summary.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(top, text="Re-run Validation", width=140,
+                      command=self._run_validation).pack(side="right")
+
+        # ttk.Treeview has no CTk equivalent — keep it but theme it to match
+        tree_container = ctk.CTkFrame(tab, corner_radius=10)
+        tree_container.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
+        tree_container.rowconfigure(0, weight=1)
+        tree_container.columnconfigure(0, weight=1)
+
+        is_dark = ctk.get_appearance_mode().lower() == "dark"
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Validation.Treeview",
+                        background="#2B2B2B" if is_dark else "#FFFFFF",
+                        foreground="#E0E0E0" if is_dark else "#222222",
+                        fieldbackground="#2B2B2B" if is_dark else "#FFFFFF",
+                        rowheight=24, borderwidth=0,
+                        font=("Calibri", 10))
+        style.configure("Validation.Treeview.Heading",
+                        background="#1F3864", foreground="white",
+                        relief="flat", font=("Calibri", 10, "bold"))
+        style.map("Validation.Treeview.Heading",
+                  background=[("active", "#2F5496")])
 
         cols = ("Severity", "Category", "Message", "Detail")
-        tree = ttk.Treeview(tab, columns=cols, show="headings", height=20)
+        tree = ttk.Treeview(tree_container, columns=cols, show="headings",
+                             height=20, style="Validation.Treeview")
         tree.heading("Severity",  text="Severity",  anchor="center")
         tree.heading("Category",  text="Category",  anchor="w")
         tree.heading("Message",   text="Message",   anchor="w")
         tree.heading("Detail",    text="Detail",    anchor="w")
-        tree.column("Severity",  width=80,  stretch=False, anchor="center")
-        tree.column("Category",  width=130, stretch=False)
-        tree.column("Message",   width=320)
+        tree.column("Severity",  width=90,  stretch=False, anchor="center")
+        tree.column("Category",  width=140, stretch=False)
+        tree.column("Message",   width=340)
         tree.column("Detail",    width=380)
 
-        tree.tag_configure("ERROR",   background="#FFCCCC", foreground="#CC0000")
-        tree.tag_configure("WARNING", background="#FFF2CC", foreground="#7B5800")
-        tree.tag_configure("INFO",    background="#E8F5E9", foreground="#1B5E20")
+        tree.tag_configure("ERROR",   background="#5C2222" if is_dark else "#FFCCCC",
+                                       foreground="#FF8080" if is_dark else "#CC0000")
+        tree.tag_configure("WARNING", background="#4A3F1A" if is_dark else "#FFF2CC",
+                                       foreground="#FFD060" if is_dark else "#7B5800")
+        tree.tag_configure("INFO",    background="#1F3A22" if is_dark else "#E8F5E9",
+                                       foreground="#90D098" if is_dark else "#1B5E20")
 
-        vsb = ttk.Scrollbar(tab, orient="vertical", command=tree.yview)
+        vsb = ctk.CTkScrollbar(tree_container, command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
-        tree.grid(row=1, column=0, sticky="nsew")
-        vsb.grid(row=1, column=1, sticky="ns")
+        tree.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
+        vsb.grid(row=0, column=1, sticky="ns", padx=(2, 10), pady=10)
 
         self.val_tree = tree
 
-    def _build_mapping_tab(self) -> None:
-        tab = ttk.Frame(self.nb, padding=8)
-        self.nb.add(tab, text="Group Mapping")
+    def _build_mapping_tab(self, tab) -> None:
         tab.rowconfigure(1, weight=1)
         tab.columnconfigure(0, weight=1)
 
-        info = ttk.Label(tab,
-            text="Assign unrecognised primary groups to standard Schedule III heads.\n"
+        ctk.CTkLabel(tab,
+            text="Assign unrecognised primary groups to standard Schedule III heads. "
                  "Groups already in the built-in map are shown but cannot be changed here.",
-            font=("Calibri", 9), foreground="#595959")
-        info.grid(row=0, column=0, sticky="ew", pady=(0,6))
+            font=ctk.CTkFont(size=10),
+            text_color="gray50", wraplength=820, anchor="w", justify="left").grid(
+            row=0, column=0, sticky="ew", padx=4, pady=(8, 6))
 
-        # Scrollable container for rows
-        container = ttk.Frame(tab)
-        container.grid(row=1, column=0, sticky="nsew")
-        container.rowconfigure(0, weight=1)
-        container.columnconfigure(0, weight=1)
+        self._mapping_inner = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        self._mapping_inner.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
 
-        canvas = tk.Canvas(container, bg="#F0F4F8", highlightthickness=0)
-        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-
-        self._mapping_inner = ttk.Frame(canvas, padding=4)
-        self._mapping_canvas_id = canvas.create_window((0, 0), window=self._mapping_inner, anchor="nw")
-
-        def _on_inner_resize(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(self._mapping_canvas_id, width=canvas.winfo_width())
-        self._mapping_inner.bind("<Configure>", _on_inner_resize)
-        canvas.bind("<Configure>", _on_inner_resize)
-        self._mapping_canvas = canvas
-
-        btn_row = ttk.Frame(tab)
-        btn_row.grid(row=2, column=0, sticky="ew", pady=(6,0))
-        ttk.Button(btn_row, text="Apply Mapping & Reload Preview",
-                   command=self._apply_mapping).pack(side="right")
+        btn_row = ctk.CTkFrame(tab, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 8))
+        ctk.CTkButton(btn_row, text="Apply Mapping & Reload Preview",
+                      width=260, height=32,
+                      command=self._apply_mapping,
+                      fg_color="#1F3864", hover_color="#2F5496").pack(side="right")
         self._mapping_vars = {}
-        self._mapping_inner_rows = []   # list of (frame) for clearing
 
     def _populate_mapping_tab(self, fd: "FinancialData") -> None:
         """Fill the mapping tab from the loaded FinancialData."""
@@ -3038,13 +3101,21 @@ class App:
         ALL_STANDARD = sorted(set(BS_MAP.keys()) | set(PNL_MAP.keys()))
         DROPDOWN_VALUES = ["(Use Auto-Infer)"] + ALL_STANDARD
 
+        self._mapping_inner.columnconfigure(0, weight=2)
+        self._mapping_inner.columnconfigure(1, weight=1)
+        self._mapping_inner.columnconfigure(2, weight=2)
+        self._mapping_inner.columnconfigure(3, weight=2)
+
         # Column headers
-        for c, lbl in enumerate(["Primary Group", "Net Balance (Rs.)", "Auto-Inferred Head", "Your Override"]):
-            ttk.Label(self._mapping_inner, text=lbl, font=("Calibri", 9, "bold"),
-                      background="#BDD7EE").grid(row=0, column=c, sticky="ew", padx=2, pady=2)
-        self._mapping_inner.columnconfigure(0, weight=1)
-        self._mapping_inner.columnconfigure(2, weight=1)
-        self._mapping_inner.columnconfigure(3, weight=1)
+        header_bg = "#1F3864"
+        for c, lbl in enumerate(["Primary Group", "Net Balance (₹)",
+                                  "Auto-Inferred Head", "Your Override"]):
+            hdr = ctk.CTkLabel(self._mapping_inner, text=lbl,
+                                font=ctk.CTkFont(size=10, weight="bold"),
+                                fg_color=header_bg, text_color="white",
+                                corner_radius=4, height=28,
+                                anchor="center" if c in (0, 3) else "e" if c == 1 else "w")
+            hdr.grid(row=0, column=c, sticky="ew", padx=2, pady=(0, 4))
 
         sorted_pgs = sorted(pg_balance.items(), key=lambda x: abs(x[1]), reverse=True)
         for row_i, (pg, bal) in enumerate(sorted_pgs, start=1):
@@ -3052,28 +3123,42 @@ class App:
             auto = pg if in_map else (infer_standard_group(pg, pg_parents[pg]) or "(no match)")
             current_override = self.reclassify_map.get(pg, "(Use Auto-Infer)")
 
-            bg = "#F0F4F8" if row_i % 2 == 0 else "#FFFFFF"
-            ttk.Label(self._mapping_inner, text=pg,
-                      font=("Calibri", 9, "bold" if not in_map else "normal"),
-                      background=bg, foreground="#CC0000" if not in_map else "#333333"
-                      ).grid(row=row_i, column=0, sticky="ew", padx=2, pady=1)
-            ttk.Label(self._mapping_inner, text=f"{bal:,.0f}",
-                      font=("Calibri", 9), background=bg
-                      ).grid(row=row_i, column=1, sticky="e", padx=2, pady=1)
-            ttk.Label(self._mapping_inner, text=auto,
-                      font=("Calibri", 9, "italic"), foreground="#595959", background=bg
-                      ).grid(row=row_i, column=2, sticky="ew", padx=2, pady=1)
+            stripe_dark  = ("gray20" if row_i % 2 == 0 else "gray15")
+            stripe_light = ("gray95" if row_i % 2 == 0 else "white")
+            stripe = (stripe_light, stripe_dark)
+
+            ctk.CTkLabel(self._mapping_inner, text=pg,
+                          font=ctk.CTkFont(size=10, weight="bold" if not in_map else "normal"),
+                          text_color="#CC0000" if not in_map else ("gray10", "gray90"),
+                          fg_color=stripe, anchor="w",
+                          corner_radius=4, height=28).grid(
+                row=row_i, column=0, sticky="ew", padx=2, pady=1)
+
+            ctk.CTkLabel(self._mapping_inner, text=f"{bal:,.0f}",
+                          font=ctk.CTkFont(size=10),
+                          fg_color=stripe, anchor="e",
+                          corner_radius=4, height=28).grid(
+                row=row_i, column=1, sticky="ew", padx=2, pady=1)
+
+            ctk.CTkLabel(self._mapping_inner, text=auto,
+                          font=ctk.CTkFont(size=10, slant="italic"),
+                          text_color="gray50", fg_color=stripe, anchor="w",
+                          corner_radius=4, height=28).grid(
+                row=row_i, column=2, sticky="ew", padx=2, pady=1)
 
             if in_map:
-                ttk.Label(self._mapping_inner, text="(built-in)",
-                          font=("Calibri", 9), foreground="#888", background=bg
-                          ).grid(row=row_i, column=3, sticky="ew", padx=2, pady=1)
+                ctk.CTkLabel(self._mapping_inner, text="(built-in)",
+                              font=ctk.CTkFont(size=10),
+                              text_color="gray55", fg_color=stripe,
+                              corner_radius=4, height=28).grid(
+                    row=row_i, column=3, sticky="ew", padx=2, pady=1)
             else:
                 var = tk.StringVar(value=current_override)
                 self._mapping_vars[pg] = var
-                cb = ttk.Combobox(self._mapping_inner, textvariable=var,
-                                  values=DROPDOWN_VALUES, state="readonly", width=28)
-                cb.grid(row=row_i, column=3, sticky="ew", padx=2, pady=1)
+                ctk.CTkOptionMenu(self._mapping_inner, variable=var,
+                                   values=DROPDOWN_VALUES, width=280,
+                                   font=ctk.CTkFont(size=10)).grid(
+                    row=row_i, column=3, sticky="ew", padx=2, pady=1)
 
     def _apply_mapping(self) -> None:
         """Save combobox selections to reclassify_map and reload preview."""
@@ -3140,7 +3225,7 @@ class App:
         # Update summary label
         summary = vr.summary()
         color = "#CC0000" if vr.has_errors else ("#7B5800" if vr.warnings else "#1B5E20")
-        self.val_summary.configure(text=summary, foreground=color)
+        self.val_summary.configure(text=summary, text_color=color)
 
     def _parse_stock(self, val: str) -> float | None:
         val = val.strip().replace(",", "")
@@ -3172,7 +3257,7 @@ class App:
         fd = self._get_fd()
         if fd is None:
             return
-        self.preview_text.config(state="normal")
+        self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
 
         def line(label, amount, indent=0):
@@ -3227,7 +3312,7 @@ class App:
             f"  Profit Before Tax:       {fd.profit_before_tax():>20,.2f}\n"
             f"  Profit After Tax:        {fd.profit_after_tax():>20,.2f}\n"
         )
-        self.preview_text.config(state="disabled")
+        self.preview_text.configure(state="disabled")
 
     def _get_proj_inputs(self) -> ProjectionInputs | None:
         try:
@@ -3305,9 +3390,9 @@ class App:
         self.op_stock.set("")
         self.cl_stock.set("")
         self.fd = None
-        self.preview_text.config(state="normal")
+        self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
-        self.preview_text.config(state="disabled")
+        self.preview_text.configure(state="disabled")
         self._set_status("Cleared. Select a Tally SQLite file to begin.")
 
 

@@ -45,7 +45,7 @@ if not exist ".venv\" (
 echo.
 
 REM ── 3. Install / upgrade dependencies ────────────────────────────────────────
-echo [..] Installing packages (openpyxl)...
+echo [..] Installing packages (openpyxl, customtkinter)...
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip --quiet
 python -m pip install --upgrade -r requirements.txt --quiet

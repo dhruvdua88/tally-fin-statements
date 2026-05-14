@@ -58,7 +58,7 @@ fi
 echo
 
 # ── 3. Install / upgrade dependencies ────────────────────────────────────────
-echo "..  Installing packages (openpyxl)..."
+echo "..  Installing packages (openpyxl, customtkinter)..."
 "$VENV/bin/pip" install --upgrade pip --quiet
 "$VENV/bin/pip" install --upgrade -r requirements.txt --quiet
 if [ $? -ne 0 ]; then
