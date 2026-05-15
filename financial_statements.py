@@ -95,6 +95,7 @@ class LedgerRow:
     opening: float
     closing: float
     is_deemedpositive: bool
+    branch: str = ""
 
 @dataclass
 class PnlRow:
@@ -102,6 +103,7 @@ class PnlRow:
     primary_group: str
     parent: str           # Tally sub-group (e.g. "Finance Costs")
     total: float          # raw sum; negative = debit (expense/purchase), positive = credit (income)
+    branch: str = ""
 
 @dataclass
 class FinancialData:
@@ -115,6 +117,7 @@ class FinancialData:
     pnl_opening: float         # P&L A/c opening (prior year retained profit not yet in Reserves)
     opening_stock_override: float | None = None
     closing_stock_override: float | None = None
+    branch_name: str = "Main"
 
     # ── Balance-sheet ledger helpers ─────────────────────────────────────────
 
@@ -730,7 +733,8 @@ def load_from_sqlite(db_path: str,
                      opening_stock_override: float | None = None,
                      closing_stock_override: float | None = None,
                      schema_vr: ValidationResult | None = None,
-                     reclassify_map: dict[str, str] | None = None) -> FinancialData:
+                     reclassify_map: dict[str, str] | None = None,
+                     branch_name: str = "Main") -> FinancialData:
     """Load financial data from a Tally SQLite export.
 
     Raises RuntimeError if schema validation finds blocking errors.
@@ -839,6 +843,7 @@ def load_from_sqlite(db_path: str,
             opening=safe_float(r["opening_raw"]),
             closing=safe_float(r["closing_raw"]),
             is_deemedpositive=str(r["is_dp"]) == "1",
+            branch=branch_name,
         ))
 
     # P&L activity from trn_accounting (kept for future use / cross-checks).
@@ -867,6 +872,7 @@ def load_from_sqlite(db_path: str,
                 primary_group=r["primary_group"],
                 parent=r["parent"],
                 total=float(r["total"] or 0),
+                branch=branch_name,
             )
             for r in pnl_txn_rows
         ]
@@ -885,6 +891,59 @@ def load_from_sqlite(db_path: str,
         pnl_opening=pnl_opening,
         opening_stock_override=opening_stock_override,
         closing_stock_override=closing_stock_override,
+        branch_name=branch_name,
+    )
+
+
+# ─── Multi-branch consolidation ───────────────────────────────────────────────
+
+def consolidate_branches(branches: list[FinancialData]) -> FinancialData:
+    """Combine multiple branch FinancialData into one consolidated FinancialData.
+
+    Periods must match exactly across all branches (period_from and period_to);
+    raises RuntimeError on mismatch.
+
+    Ledgers and pnl_rows are concatenated (preserving their `branch` tag).
+    pnl_balance, pnl_opening, and stock overrides are summed across branches.
+    """
+    if not branches:
+        raise RuntimeError("No branches to consolidate.")
+    if len(branches) == 1:
+        return branches[0]
+
+    pf = branches[0].period_from
+    pt = branches[0].period_to
+    for b in branches[1:]:
+        if b.period_from != pf or b.period_to != pt:
+            raise RuntimeError(
+                f"Period mismatch: '{branches[0].branch_name}' is "
+                f"{pf} → {pt}, but '{b.branch_name}' is "
+                f"{b.period_from} → {b.period_to}. "
+                f"All branches must cover the same period to consolidate."
+            )
+
+    all_ledgers: list[LedgerRow] = []
+    all_pnl_rows: list[PnlRow] = []
+    for b in branches:
+        all_ledgers.extend(b.ledgers)
+        all_pnl_rows.extend(b.pnl_rows)
+
+    def _sum_opt(vals: list[float | None]) -> float | None:
+        present = [v for v in vals if v is not None]
+        return sum(present) if present else None
+
+    return FinancialData(
+        company=" + ".join(b.company for b in branches),
+        period_from=pf,
+        period_to=pt,
+        period_label=branches[0].period_label,
+        ledgers=all_ledgers,
+        pnl_rows=all_pnl_rows,
+        pnl_balance=sum(b.pnl_balance for b in branches),
+        pnl_opening=sum(b.pnl_opening for b in branches),
+        opening_stock_override=_sum_opt([b.opening_stock_override for b in branches]),
+        closing_stock_override=_sum_opt([b.closing_stock_override for b in branches]),
+        branch_name="Consolidated",
     )
 
 
@@ -927,11 +986,32 @@ def _fmt(ws, cell_ref: str, value: float | None, italic: bool = False) -> None:
 
 
 class ExcelWriter:
-    def __init__(self, fd: FinancialData, proj: "ProjectionInputs | None" = None):
+    def __init__(self, fd: FinancialData, proj: "ProjectionInputs | None" = None,
+                 branches: list[FinancialData] | None = None):
         self.fd = fd
         self.proj = proj
+        # branches: per-branch FinancialData list. If None or len <= 1, the workbook
+        # uses single-column BS/P&L. If len >= 2, branch columns + Total are emitted.
+        self.branches: list[FinancialData] = branches or []
         self.wb = openpyxl.Workbook()
         self.wb.remove(self.wb.active)  # remove default sheet
+
+    @property
+    def _multibranch(self) -> bool:
+        return len(self.branches) >= 2
+
+    def _value_cols(self) -> tuple[list[str], str, str]:
+        """Return (per_branch_col_letters, total_col_letter, last_col_letter).
+
+        Single-branch: branches=["C"], total="C", last="D" (preserves Previous Year col).
+        Multi-branch:  branches=["C","D",...], total=letter_after, last=total.
+        """
+        if not self._multibranch:
+            return (["C"], "C", "D")
+        n = len(self.branches)
+        bcols = [get_column_letter(3 + i) for i in range(n)]
+        total = get_column_letter(3 + n)
+        return (bcols, total, total)
 
     def save(self, path: str) -> None:
         self._write_bs()
@@ -1012,15 +1092,25 @@ class ExcelWriter:
     def _write_bs(self) -> None:
         ws = self.wb.create_sheet("Balance Sheet")
         fd = self.fd
+        bcols, tcol, last_col = self._value_cols()
+        multi = self._multibranch
+
         ws.column_dimensions["A"].width = 46
         ws.column_dimensions["B"].width = 8
-        ws.column_dimensions["C"].width = 18
-        ws.column_dimensions["D"].width = 18
+        if multi:
+            for bc in bcols:
+                ws.column_dimensions[bc].width = 16
+            ws.column_dimensions[tcol].width = 18
+        else:
+            ws.column_dimensions["C"].width = 18
+            ws.column_dimensions["D"].width = 18
+
+        merge_span = f"A{{r}}:{last_col}{{r}}"
 
         r = 1
-        def header(text, span=4, bg=C_HEADER_BG, fg=C_WHITE, sz=12, bold=True):
+        def header(text, bg=C_HEADER_BG, fg=C_WHITE, sz=12, bold=True):
             nonlocal r
-            ws.merge_cells(f"A{r}:D{r}")
+            ws.merge_cells(merge_span.format(r=r))
             cell = ws[f"A{r}"]
             cell.value = text
             cell.font = _font(bold=bold, size=sz, color=fg)
@@ -1030,7 +1120,7 @@ class ExcelWriter:
 
         def subheader(text, bg=C_SUBHD_BG):
             nonlocal r
-            ws.merge_cells(f"A{r}:D{r}")
+            ws.merge_cells(merge_span.format(r=r))
             cell = ws[f"A{r}"]
             cell.value = text
             cell.font = _font(bold=True, size=10)
@@ -1042,17 +1132,29 @@ class ExcelWriter:
             nonlocal r
             ws[f"A{r}"].value = "Particulars"
             ws[f"B{r}"].value = "Note"
-            ws[f"C{r}"].value = f"As at {fd.period_label}"
-            ws[f"D{r}"].value = f"Previous Year"
-            for col in "ABCD":
-                c = ws[f"{col}{r}"]
+            if multi:
+                for i, b in enumerate(self.branches):
+                    ws[f"{bcols[i]}{r}"].value = b.branch_name
+                ws[f"{tcol}{r}"].value = f"Consolidated\n(As at {fd.period_label})"
+            else:
+                ws[f"C{r}"].value = f"As at {fd.period_label}"
+                ws[f"D{r}"].value = "Previous Year"
+            for col_idx in range(1, ws[f"{last_col}{r}"].column + 1):
+                col_letter = get_column_letter(col_idx)
+                c = ws[f"{col_letter}{r}"]
                 c.font = _font(bold=True, size=9, color=C_WHITE)
                 c.fill = _fill(C_MID_BLUE)
-                c.alignment = _align("center")
+                c.alignment = _align("center", wrap=True)
                 c.border = _border()
+            if multi:
+                ws.row_dimensions[r].height = 30
             r += 1
 
-        def row(label, amount, note=None, indent=0, bold=False, total=False, fmt=INR):
+        def _value_for(branch_fd: FinancialData, fn) -> float:
+            return fn(branch_fd)
+
+        def row(label, amount_fn, note=None, indent=0, bold=False, total=False, fmt=INR):
+            """amount_fn: callable(FinancialData)->float, or None to leave blank."""
             nonlocal r
             prefix = "  " * indent
             ws[f"A{r}"].value = prefix + label
@@ -1064,112 +1166,122 @@ class ExcelWriter:
                 ws[f"B{r}"].hyperlink = f"#'{note_sheet_name}'!A1"
                 ws[f"B{r}"].font = Font(name="Calibri", size=9, color="1D4ED8", underline="single")
                 ws[f"B{r}"].alignment = _align("center")
-            if amount is not None:
-                ws[f"C{r}"].value = amount
-                ws[f"C{r}"].number_format = fmt
-                ws[f"C{r}"].font = _font(bold=bold or total, size=10)
-                ws[f"C{r}"].alignment = _align("right")
+            if amount_fn is not None:
+                if multi:
+                    for i, b in enumerate(self.branches):
+                        cell = ws[f"{bcols[i]}{r}"]
+                        cell.value = _value_for(b, amount_fn)
+                        cell.number_format = fmt
+                        cell.font = _font(bold=bold or total, size=10)
+                        cell.alignment = _align("right")
+                cell = ws[f"{tcol}{r}"]
+                cell.value = _value_for(fd, amount_fn)
+                cell.number_format = fmt
+                cell.font = _font(bold=bold or total, size=10)
+                cell.alignment = _align("right")
             if total:
-                for col in "AC":
+                cols_to_fill = ["A"] + (bcols if multi else []) + [tcol]
+                for col in cols_to_fill:
                     ws[f"{col}{r}"].fill = _fill(C_TOTAL_BG)
                     ws[f"{col}{r}"].border = _border()
             r += 1
-            return r - 1  # return row number for formula references
+            return r - 1
+
+        def formula_row(label, ref_rows, bold=False, total=False, fmt=INR, op="+"):
+            """Writes a formula = ref_rows[0] op ref_rows[1] op ... in each value column."""
+            nonlocal r
+            ws[f"A{r}"].value = label
+            ws[f"A{r}"].font = _font(bold=bold or total, size=10)
+            all_cols = (bcols if multi else []) + [tcol]
+            for col in all_cols:
+                cell = ws[f"{col}{r}"]
+                cell.value = "=" + op.join(f"{col}{rr}" for rr in ref_rows)
+                cell.number_format = fmt
+                cell.font = _font(bold=bold or total, size=10)
+                cell.alignment = _align("right")
+            if total:
+                cols_to_fill = ["A"] + all_cols
+                for col in cols_to_fill:
+                    ws[f"{col}{r}"].fill = _fill(C_TOTAL_BG)
+                    ws[f"{col}{r}"].border = _border()
+            r += 1
+            return r - 1
 
         def spacer():
             nonlocal r
             r += 1
 
         header(fd.company.upper(), sz=14)
-        header("BALANCE SHEET", sz=12)
+        header("BALANCE SHEET" + ("  (Branch-wise + Consolidated)" if multi else ""), sz=12)
         header(f"As at {fd.period_label}", sz=10, bg=C_MID_BLUE)
         header("(Amount in ₹)", sz=9, bg=C_LIGHT_BLUE, fg=C_BLACK, bold=False)
         col_header()
 
         # ── EQUITY & LIABILITIES ──────────────────────────────────────────────
         subheader("I.  SHAREHOLDERS' FUNDS")
-        sc_r  = row("  a)  Share Capital",           fd.share_capital(),       note="1", indent=0)
-        res_r = row("  b)  Reserves & Surplus",      fd.reserves_surplus(),    note="2", indent=0)
-        row("Total Shareholders' Funds",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{sc_r}+C{res_r}"
-        ws[f"C{r-1}"].number_format = INR
+        sc_r  = row("  a)  Share Capital",           lambda b: b.share_capital(),       note="1")
+        res_r = row("  b)  Reserves & Surplus",      lambda b: b.reserves_surplus(),    note="2")
+        formula_row("Total Shareholders' Funds", [sc_r, res_r], bold=True, total=True)
         spacer()
 
         subheader("II.  NON-CURRENT LIABILITIES")
-        ltb_r = row("  a)  Long-Term Borrowings",    fd.long_term_borrowings(), note="3", indent=0)
-        dtl_r = row("  b)  Deferred Tax Liability",  fd.deferred_tax_liability(), indent=0)
-        row("Total Non-Current Liabilities",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{ltb_r}+C{dtl_r}"
-        ws[f"C{r-1}"].number_format = INR
+        ltb_r = row("  a)  Long-Term Borrowings",    lambda b: b.long_term_borrowings(), note="3")
+        dtl_r = row("  b)  Deferred Tax Liability",  lambda b: b.deferred_tax_liability())
+        formula_row("Total Non-Current Liabilities", [ltb_r, dtl_r], bold=True, total=True)
         spacer()
 
         subheader("III.  CURRENT LIABILITIES")
-        stb_r  = row("  a)  Short-Term Borrowings",  fd.short_term_borrowings(), note="4", indent=0)
-        tp_r   = row("  b)  Trade Payables",         fd.trade_payables(),         note="5", indent=0)
-        dt_r   = row("  c)  Duties & Taxes (Net)",   max(0, fd.duties_and_taxes_net()), indent=0)
-        ocl_r  = row("  d)  Other Current Liabilities", fd.other_current_liabilities(), note="6", indent=0)
-        prov_r = row("  e)  Short-Term Provisions",  fd.short_term_provisions(),  note="7", indent=0)
-        row("Total Current Liabilities",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{stb_r}+C{tp_r}+C{dt_r}+C{ocl_r}+C{prov_r}"
-        ws[f"C{r-1}"].number_format = INR
-        total_cl_r = r - 1
+        stb_r  = row("  a)  Short-Term Borrowings",     lambda b: b.short_term_borrowings(), note="4")
+        tp_r   = row("  b)  Trade Payables",            lambda b: b.trade_payables(),         note="5")
+        dt_r   = row("  c)  Duties & Taxes (Net)",      lambda b: max(0, b.duties_and_taxes_net()))
+        ocl_r  = row("  d)  Other Current Liabilities", lambda b: b.other_current_liabilities(), note="6")
+        prov_r = row("  e)  Short-Term Provisions",     lambda b: b.short_term_provisions(),  note="7")
+        formula_row("Total Current Liabilities",
+                    [stb_r, tp_r, dt_r, ocl_r, prov_r], bold=True, total=True)
         spacer()
 
         # Grand total E&L
-        row("TOTAL EQUITY & LIABILITIES", None, bold=True)
-        ws[f"C{r-1}"].value = fd.total_equity_liabilities()
-        ws[f"C{r-1}"].number_format = INR
-        ws[f"C{r-1}"].font = _font(bold=True, size=11)
-        ws[f"C{r-1}"].fill = _fill(C_HEADER_BG)
-        ws[f"C{r-1}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
-        ws[f"A{r-1}"].fill = _fill(C_HEADER_BG)
-        ws[f"A{r-1}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
-        total_el_row = r - 1
+        te_r = row("TOTAL EQUITY & LIABILITIES", lambda b: b.total_equity_liabilities(), bold=True)
+        all_value_cols = (bcols if multi else ["C"]) + ([tcol] if multi else [])
+        for col in ["A"] + all_value_cols:
+            ws[f"{col}{te_r}"].fill = _fill(C_HEADER_BG)
+            ws[f"{col}{te_r}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
         spacer(); spacer()
 
         # ── ASSETS ───────────────────────────────────────────────────────────
         subheader("I.  NON-CURRENT ASSETS")
-        fa_r   = row("  a)  Fixed Assets (Net Block)",     fd.net_fixed_assets(),          note="8", indent=0)
-        inv_r  = row("  b)  Non-Current Investments",      fd.non_current_investments(),   note="9", indent=0)
-        lla_r  = row("  c)  Long-Term Loans & Advances",   fd.long_term_loans_advances(),  note="10", indent=0)
-        dta_r  = row("  d)  Deferred Tax Asset",           fd.deferred_tax_asset(),        indent=0)
-        ona_r  = row("  e)  Other Non-Current Assets",     fd.other_noncurrent_assets(),   indent=0)
-        row("Total Non-Current Assets",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{fa_r}+C{inv_r}+C{lla_r}+C{dta_r}+C{ona_r}"
-        ws[f"C{r-1}"].number_format = INR
+        fa_r   = row("  a)  Fixed Assets (Net Block)",     lambda b: b.net_fixed_assets(),          note="8")
+        inv_r  = row("  b)  Non-Current Investments",      lambda b: b.non_current_investments(),   note="9")
+        lla_r  = row("  c)  Long-Term Loans & Advances",   lambda b: b.long_term_loans_advances(),  note="10")
+        dta_r  = row("  d)  Deferred Tax Asset",           lambda b: b.deferred_tax_asset())
+        ona_r  = row("  e)  Other Non-Current Assets",     lambda b: b.other_noncurrent_assets())
+        formula_row("Total Non-Current Assets",
+                    [fa_r, inv_r, lla_r, dta_r, ona_r], bold=True, total=True)
         spacer()
 
         subheader("II.  CURRENT ASSETS")
-        stk_r  = row("  a)  Inventories (Closing Stock)",  fd.closing_stock(),             note="11", indent=0)
-        tr_r   = row("  b)  Trade Receivables",            fd.trade_receivables(),         note="12", indent=0)
-        cb_r   = row("  c)  Cash & Cash Equivalents",      fd.cash_and_bank(),             note="13", indent=0)
-        oca_r  = row("  d)  Other Current Assets",         fd.other_current_assets(),      note="14", indent=0)
-        row("Total Current Assets",
-            None, bold=True, total=True)
-        ws[f"C{r-1}"].value = f"=C{stk_r}+C{tr_r}+C{cb_r}+C{oca_r}"
-        ws[f"C{r-1}"].number_format = INR
+        stk_r  = row("  a)  Inventories (Closing Stock)",  lambda b: b.closing_stock(),             note="11")
+        tr_r   = row("  b)  Trade Receivables",            lambda b: b.trade_receivables(),         note="12")
+        cb_r   = row("  c)  Cash & Cash Equivalents",      lambda b: b.cash_and_bank(),             note="13")
+        oca_r  = row("  d)  Other Current Assets",         lambda b: b.other_current_assets(),      note="14")
+        formula_row("Total Current Assets",
+                    [stk_r, tr_r, cb_r, oca_r], bold=True, total=True)
         spacer()
 
-        row("TOTAL ASSETS", None, bold=True)
-        ws[f"C{r-1}"].value = fd.total_assets()
-        ws[f"C{r-1}"].number_format = INR
-        ws[f"C{r-1}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
-        ws[f"C{r-1}"].fill = _fill(C_HEADER_BG)
-        ws[f"A{r-1}"].fill = _fill(C_HEADER_BG)
-        ws[f"A{r-1}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
+        ta_r = row("TOTAL ASSETS", lambda b: b.total_assets(), bold=True)
+        for col in ["A"] + all_value_cols:
+            ws[f"{col}{ta_r}"].fill = _fill(C_HEADER_BG)
+            ws[f"{col}{ta_r}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
         spacer(); spacer()
 
         # ── Difference check ─────────────────────────────────────────────────
-        diff = fd.total_assets() - fd.total_equity_liabilities()
-        row("Balance Sheet Difference (should be 0)", diff,
-            bold=True if abs(diff) > 1 else False)
-        if abs(diff) > 1:
-            ws[f"C{r-1}"].fill = _fill("FF0000")
-            ws[f"C{r-1}"].font = Font(bold=True, size=10, color=C_WHITE)
+        diff_r = row("Balance Sheet Difference (should be 0)",
+                     lambda b: b.total_assets() - b.total_equity_liabilities())
+        for col in all_value_cols:
+            v = ws[f"{col}{diff_r}"].value
+            if isinstance(v, (int, float)) and abs(v) > 1:
+                ws[f"{col}{diff_r}"].fill = _fill("FF0000")
+                ws[f"{col}{diff_r}"].font = Font(bold=True, size=10, color=C_WHITE)
         spacer(); spacer()
 
         ws.freeze_panes = "A6"
@@ -1220,6 +1332,12 @@ class ExcelWriter:
 
         return ws, 3   # next row to write at
 
+    def _ledger_label(self, l: LedgerRow) -> str:
+        """Prefix ledger name with branch tag in multi-branch workbooks."""
+        if self._multibranch and l.branch:
+            return f"[{l.branch}] {l.name}"
+        return l.name
+
     def _note_data_row(self, ws, r: int, label: str, amount: float | None = None,
                        bold: bool = False, total: bool = False, indent: int = 0) -> int:
         prefix = "    " * indent
@@ -1240,7 +1358,7 @@ class ExcelWriter:
         fd = self.fd
         for l in fd._ledgers_for("Capital Account"):
             if "reserve" not in l.name.lower() and "profit" not in l.name.lower():
-                r = self._note_data_row(ws, r, l.name, l.closing)
+                r = self._note_data_row(ws, r, self._ledger_label(l), l.closing)
         r = self._note_data_row(ws, r, "Total Share Capital", fd.share_capital(), total=True)
 
     def _write_note_reserves(self):
@@ -1248,9 +1366,9 @@ class ExcelWriter:
         fd = self.fd
         for l in fd._ledgers_for("Capital Account"):
             if "reserve" in l.name.lower():
-                r = self._note_data_row(ws, r, l.name, l.closing)
+                r = self._note_data_row(ws, r, self._ledger_label(l), l.closing)
         for l in fd._ledgers_for("Reserves & Surplus"):
-            r = self._note_data_row(ws, r, l.name, l.closing)
+            r = self._note_data_row(ws, r, self._ledger_label(l), l.closing)
         r = self._note_data_row(ws, r, "Profit for the year (P&L A/c)", fd.pnl_balance)
         r = self._note_data_row(ws, r, "Total Reserves & Surplus", fd.reserves_surplus(), total=True)
 
@@ -1263,20 +1381,20 @@ class ExcelWriter:
                 continue
             r = self._note_data_row(ws, r, pg, bold=True)
             for l in group_ledgers:
-                r = self._note_data_row(ws, r, l.name, l.closing, indent=1)
+                r = self._note_data_row(ws, r, self._ledger_label(l), l.closing, indent=1)
         r = self._note_data_row(ws, r, "Total Long-Term Borrowings", fd.long_term_borrowings(), total=True)
 
     def _write_note_st_borrowings(self):
         ws, r = self._start_note_sheet(4, "Short-Term Borrowings")
         fd = self.fd
         for l in fd._ledgers_for("Bank OD A/c"):
-            r = self._note_data_row(ws, r, l.name, l.closing)
+            r = self._note_data_row(ws, r, self._ledger_label(l), l.closing)
         # Bank accounts with credit balance = OD
         od_banks = [l for l in fd._ledgers_for("Bank Accounts") if l.closing > 0]
         if od_banks:
             r = self._note_data_row(ws, r, "Bank Accounts (credit/OD balance)", bold=True)
             for l in od_banks:
-                r = self._note_data_row(ws, r, l.name, l.closing, indent=1)
+                r = self._note_data_row(ws, r, self._ledger_label(l), l.closing, indent=1)
         r = self._note_data_row(ws, r, "Total Short-Term Borrowings",
                                 fd.short_term_borrowings() + fd.bank_od_in_bank_accounts(), total=True)
 
@@ -1344,12 +1462,12 @@ class ExcelWriter:
         if fd._ledgers_for("Cash-in-hand"):
             r = self._note_data_row(ws, r, "Cash-in-Hand", bold=True)
             for l in fd._ledgers_for("Cash-in-hand"):
-                r = self._note_data_row(ws, r, l.name, -l.closing, indent=1)
+                r = self._note_data_row(ws, r, self._ledger_label(l), -l.closing, indent=1)
         asset_banks = [l for l in fd._ledgers_for("Bank Accounts") if l.closing < 0]
         if asset_banks:
             r = self._note_data_row(ws, r, "Bank Accounts (debit balance)", bold=True)
             for l in asset_banks:
-                r = self._note_data_row(ws, r, l.name, -l.closing, indent=1)
+                r = self._note_data_row(ws, r, self._ledger_label(l), -l.closing, indent=1)
         r = self._note_data_row(ws, r, "Total Cash & Cash Equivalents", fd.cash_and_bank(), total=True)
 
     def _write_notes_index(self):
@@ -1405,15 +1523,27 @@ class ExcelWriter:
     def _write_pnl(self) -> None:
         ws = self.wb.create_sheet("P&L Statement")
         fd = self.fd
+        bcols, tcol, last_col = self._value_cols()
+        multi = self._multibranch
+
         ws.column_dimensions["A"].width = 50
         ws.column_dimensions["B"].width = 8
-        ws.column_dimensions["C"].width = 18
+        if multi:
+            for bc in bcols:
+                ws.column_dimensions[bc].width = 16
+            ws.column_dimensions[tcol].width = 18
+        else:
+            ws.column_dimensions["C"].width = 18
+
+        # For P&L, last visible column is the total column (no Previous Year col here)
+        merge_last = tcol
+        merge_span = f"A{{r}}:{merge_last}{{r}}"
 
         r = 1
 
         def header(text, bg=C_HEADER_BG, fg=C_WHITE, sz=12, bold=True):
             nonlocal r
-            ws.merge_cells(f"A{r}:C{r}")
+            ws.merge_cells(merge_span.format(r=r))
             c = ws[f"A{r}"]
             c.value = text
             c.font = _font(bold=bold, size=sz, color=fg)
@@ -1421,21 +1551,49 @@ class ExcelWriter:
             c.alignment = _align("center")
             r += 1
 
-        def row(label, amount=None, bold=False, total=False, indent=0, italic=False, bg=None):
+        all_value_cols = (bcols if multi else []) + [tcol]
+        all_value_cols_single_or_total = bcols if multi else ["C"]
+
+        def row(label, amount_fn=None, bold=False, total=False, indent=0, italic=False, bg=None):
             nonlocal r
             ws[f"A{r}"].value = "  " * indent + label
             ws[f"A{r}"].font = _font(bold=bold or total, size=10, name="Calibri")
             if italic:
                 ws[f"A{r}"].font = Font(italic=True, size=10, name="Calibri")
-            if amount is not None:
-                ws[f"C{r}"].value = amount
-                ws[f"C{r}"].number_format = INR
-                ws[f"C{r}"].font = _font(bold=bold or total, size=10)
-                ws[f"C{r}"].alignment = _align("right")
+            if amount_fn is not None:
+                if multi:
+                    for i, b in enumerate(self.branches):
+                        cell = ws[f"{bcols[i]}{r}"]
+                        cell.value = amount_fn(b)
+                        cell.number_format = INR
+                        cell.font = _font(bold=bold or total, size=10)
+                        cell.alignment = _align("right")
+                cell = ws[f"{tcol}{r}"]
+                cell.value = amount_fn(fd)
+                cell.number_format = INR
+                cell.font = _font(bold=bold or total, size=10)
+                cell.alignment = _align("right")
             if total or bg:
                 col_bg = bg or C_TOTAL_BG
-                ws[f"A{r}"].fill = _fill(col_bg)
-                ws[f"C{r}"].fill = _fill(col_bg)
+                for col in ["A"] + all_value_cols:
+                    ws[f"{col}{r}"].fill = _fill(col_bg)
+            r += 1
+            return r - 1
+
+        def formula_row(label, ref_rows, op="+", bold=False, total=False, bg=None):
+            nonlocal r
+            ws[f"A{r}"].value = label
+            ws[f"A{r}"].font = _font(bold=bold or total, size=10, name="Calibri")
+            for col in all_value_cols:
+                cell = ws[f"{col}{r}"]
+                cell.value = "=" + op.join(f"{col}{rr}" for rr in ref_rows)
+                cell.number_format = INR
+                cell.font = _font(bold=bold or total, size=10)
+                cell.alignment = _align("right")
+            if total or bg:
+                col_bg = bg or C_TOTAL_BG
+                for col in ["A"] + all_value_cols:
+                    ws[f"{col}{r}"].fill = _fill(col_bg)
             r += 1
             return r - 1
 
@@ -1443,69 +1601,71 @@ class ExcelWriter:
             nonlocal r; r += 1
 
         header(fd.company.upper(), sz=13)
-        header("STATEMENT OF PROFIT & LOSS", sz=11)
+        header("STATEMENT OF PROFIT & LOSS" + ("  (Branch-wise + Consolidated)" if multi else ""), sz=11)
         header(f"For the Year Ended {fd.period_label}", sz=10, bg=C_MID_BLUE)
         header("(Amount in ₹)", sz=9, bg=C_LIGHT_BLUE, fg=C_BLACK, bold=False)
 
         # Column labels
         ws[f"A{r}"].value = "Particulars"
         ws[f"B{r}"].value = "Note"
-        ws[f"C{r}"].value = "Current Year"
-        for col in "ABC":
-            c = ws[f"{col}{r}"]
+        if multi:
+            for i, b in enumerate(self.branches):
+                ws[f"{bcols[i]}{r}"].value = b.branch_name
+            ws[f"{tcol}{r}"].value = "Consolidated"
+        else:
+            ws[f"C{r}"].value = "Current Year"
+        for col_idx in range(1, ws[f"{tcol}{r}"].column + 1):
+            col_letter = get_column_letter(col_idx)
+            c = ws[f"{col_letter}{r}"]
             c.font = _font(bold=True, size=9, color=C_WHITE)
             c.fill = _fill(C_MID_BLUE)
-            c.alignment = _align("center")
+            c.alignment = _align("center", wrap=True)
             c.border = _border()
+        if multi:
+            ws.row_dimensions[r].height = 28
         r += 1
 
         # ── Revenue ──────────────────────────────────────────────────────────
-        rev_r  = row("I.   Revenue from Operations",  fd.revenue_from_ops(), bold=True)
-        oth_r  = row("II.  Other Income",              fd.other_income(),    bold=True)
-        tot_r  = row("III. Total Revenue (I + II)",    None, bold=True, total=True)
-        ws[f"C{tot_r}"].value  = f"=C{rev_r}+C{oth_r}"
-        ws[f"C{tot_r}"].number_format = INR
+        rev_r  = row("I.   Revenue from Operations",  lambda b: b.revenue_from_ops(), bold=True)
+        oth_r  = row("II.  Other Income",              lambda b: b.other_income(),    bold=True)
+        tot_r  = formula_row("III. Total Revenue (I + II)", [rev_r, oth_r], bold=True, total=True)
         spacer()
 
         # ── Expenses ─────────────────────────────────────────────────────────
         row("IV.  Expenses", bold=True)
-        pur_r  = row("     a)  Cost of Materials / Purchases", fd.purchases(), indent=1)
+        pur_r  = row("     a)  Cost of Materials / Purchases", lambda b: b.purchases(), indent=1)
         chg_r  = row("     b)  Changes in Inventories",
-                      fd.opening_stock() - fd.closing_stock(), indent=1,
-                      italic=True)
+                     lambda b: b.opening_stock() - b.closing_stock(), indent=1, italic=True)
         row("          (Opening Stock - Closing Stock)", italic=True, indent=2)
-        emp_r  = row("     c)  Employee Benefits Expense",  fd.employee_costs(), indent=1)
-        fin_r  = row("     d)  Finance Costs",              fd.finance_costs(), indent=1)
-        dep_r  = row("     e)  Depreciation & Amortisation",fd.depreciation_from_fa(), indent=1)
-        oth2_r = row("     f)  Other Expenses",             fd.other_indirect_expenses() + fd.direct_expenses(), indent=1)
+        emp_r  = row("     c)  Employee Benefits Expense",  lambda b: b.employee_costs(), indent=1)
+        fin_r  = row("     d)  Finance Costs",              lambda b: b.finance_costs(), indent=1)
+        dep_r  = row("     e)  Depreciation & Amortisation",lambda b: b.depreciation_from_fa(), indent=1)
+        oth2_r = row("     f)  Other Expenses",
+                     lambda b: b.other_indirect_expenses() + b.direct_expenses(), indent=1)
 
         # Show breakdown of Other Expenses
-        row("          Direct Expenses", fd.direct_expenses(), indent=3, italic=True)
-        row("          Indirect Expenses (excl. Finance & Employee)", fd.other_indirect_expenses(), indent=3, italic=True)
+        row("          Direct Expenses",                         lambda b: b.direct_expenses(),         indent=3, italic=True)
+        row("          Indirect Expenses (excl. Finance & Employee)",
+            lambda b: b.other_indirect_expenses(), indent=3, italic=True)
 
-        tot_exp_r = row("     Total Expenses", None, bold=True, total=True)
-        ws[f"C{tot_exp_r}"].value = (
-            f"=C{pur_r}+C{chg_r}+C{emp_r}+C{fin_r}+C{dep_r}+C{oth2_r}"
-        )
-        ws[f"C{tot_exp_r}"].number_format = INR
+        tot_exp_r = formula_row("     Total Expenses",
+                                [pur_r, chg_r, emp_r, fin_r, dep_r, oth2_r],
+                                bold=True, total=True)
         spacer()
 
         # ── Profit lines ─────────────────────────────────────────────────────
-        pbt_r = row("V.   Profit Before Tax (III − Expenses)", None, bold=True, total=True)
-        ws[f"C{pbt_r}"].value = f"=C{tot_r}-C{tot_exp_r}"
-        ws[f"C{pbt_r}"].number_format = INR
-
-        tax_r = row("VI.  Tax Expense (Deferred Tax Provision)", fd.tax_expense())
-        pat_r = row("VII. Profit After Tax", None, bold=True, bg=C_HEADER_BG)
-        ws[f"C{pat_r}"].value = f"=C{pbt_r}-C{tax_r}"
-        ws[f"C{pat_r}"].number_format = INR
-        ws[f"C{pat_r}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
-        ws[f"A{pat_r}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
+        pbt_r = formula_row("V.   Profit Before Tax (III − Expenses)",
+                            [tot_r, tot_exp_r], op="-", bold=True, total=True)
+        tax_r = row("VI.  Tax Expense (Deferred Tax Provision)", lambda b: b.tax_expense())
+        pat_r = formula_row("VII. Profit After Tax", [pbt_r, tax_r], op="-",
+                            bold=True, bg=C_HEADER_BG)
+        for col in ["A"] + all_value_cols:
+            ws[f"{col}{pat_r}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
         spacer(); spacer()
 
         # ── Key ratios ───────────────────────────────────────────────────────
-        ws.merge_cells(f"A{r}:C{r}")
-        ws[f"A{r}"].value = "KEY FINANCIAL RATIOS"
+        ws.merge_cells(merge_span.format(r=r))
+        ws[f"A{r}"].value = "KEY FINANCIAL RATIOS" + ("  (Consolidated)" if multi else "")
         ws[f"A{r}"].font = _font(bold=True, size=10, color=C_WHITE)
         ws[f"A{r}"].fill = _fill(C_MID_BLUE)
         r += 1
@@ -1521,10 +1681,9 @@ class ExcelWriter:
         ]
         for lbl, amt, ratio in ratios:
             ws[f"A{r}"].value = "  " + lbl
-            ws[f"C{r}"].value = amt
-            ws[f"C{r}"].number_format = INR
-            ws[f"C{r}"].alignment = _align("right")
-            # ratio in column B area as comment
+            ws[f"{tcol}{r}"].value = amt
+            ws[f"{tcol}{r}"].number_format = INR
+            ws[f"{tcol}{r}"].alignment = _align("right")
             ws[f"B{r}"].value = ratio
             ws[f"B{r}"].font = _font(size=8, color="595959")
             ws[f"B{r}"].alignment = _align("center", wrap=True)
@@ -1999,12 +2158,13 @@ class App:
         self.root.minsize(640, 580)
         self.root.configure(bg=self._BG)
 
-        self.db_path    = tk.StringVar()
         self.out_dir    = tk.StringVar(value=str(Path.home() / "Desktop"))
         self.op_stock   = tk.StringVar()
         self.cl_stock   = tk.StringVar()
-        self.status_var = tk.StringVar(value="Drop a Tally SQLite file or click Browse…")
-        self.fd: FinancialData | None = None
+        self.status_var = tk.StringVar(value="Add one or more Tally SQLite files (one per branch).")
+        # Multi-branch state: list of dicts {path, name, fd}
+        self._branches: list[dict] = []
+        self.fd: FinancialData | None = None    # consolidated (or single)
         self._vr        = None          # last ValidationResult
         self._proj_open = False         # collapsible state
 
@@ -2081,22 +2241,52 @@ class App:
         main = self._inner
         main.columnconfigure(0, weight=1)
 
-        # ── File picker ───────────────────────────────────────────────────────
-        fp = ttk.LabelFrame(main, text="  Source File", padding=10)
+        # ── Branches list ─────────────────────────────────────────────────────
+        fp = ttk.LabelFrame(main, text="  Source Files  (add one per branch — they will be consolidated)",
+                            padding=10)
         fp.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        fp.columnconfigure(1, weight=1)
+        fp.columnconfigure(0, weight=1)
 
-        ttk.Label(fp, text="Tally SQLite:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(fp, textvariable=self.db_path, width=52).grid(row=0, column=1, sticky="ew")
-        ttk.Button(fp, text="Browse…", command=self._pick_db,
+        # Treeview of branches
+        tv_frame = ttk.Frame(fp)
+        tv_frame.grid(row=0, column=0, sticky="ew")
+        tv_frame.columnconfigure(0, weight=1)
+        self._branch_tree = ttk.Treeview(
+            tv_frame, columns=("name", "company", "period", "file"),
+            show="headings", height=4, selectmode="browse",
+        )
+        for col, lbl, w in [("name", "Branch Name", 140),
+                            ("company", "Company", 200),
+                            ("period", "Period", 180),
+                            ("file", "File", 200)]:
+            self._branch_tree.heading(col, text=lbl)
+            self._branch_tree.column(col, width=w, stretch=(col == "file"))
+        self._branch_tree.grid(row=0, column=0, sticky="ew")
+        tv_vsb = ttk.Scrollbar(tv_frame, orient="vertical", command=self._branch_tree.yview)
+        self._branch_tree.configure(yscrollcommand=tv_vsb.set)
+        tv_vsb.grid(row=0, column=1, sticky="ns")
+        self._branch_tree.bind("<Double-1>", lambda e: self._rename_branch())
+
+        # Buttons row
+        btn_row = ttk.Frame(fp)
+        btn_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(btn_row, text="+ Add Branch…", command=self._add_branch,
+                   style="Small.TButton").pack(side="left")
+        ttk.Button(btn_row, text="Rename", command=self._rename_branch,
+                   style="Small.TButton").pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Remove", command=self._remove_branch,
+                   style="Small.TButton").pack(side="left", padx=(6, 0))
+        ttk.Label(btn_row, text="  (Tip: double-click a row to rename)",
+                  font=("Calibri", 8), foreground="#595959").pack(side="left", padx=(8, 0))
+
+        # Output folder
+        out_row = ttk.Frame(fp)
+        out_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        out_row.columnconfigure(1, weight=1)
+        ttk.Label(out_row, text="Output Folder:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(out_row, textvariable=self.out_dir).grid(row=0, column=1, sticky="ew")
+        ttk.Button(out_row, text="Browse…", command=self._pick_outdir,
                    style="Small.TButton").grid(row=0, column=2, padx=(8, 0))
-
-        ttk.Label(fp, text="Output Folder:").grid(row=1, column=0, sticky="w",
-                                                   padx=(0, 8), pady=(6, 0))
-        ttk.Entry(fp, textvariable=self.out_dir, width=52).grid(row=1, column=1,
-                                                                  sticky="ew", pady=(6, 0))
-        ttk.Button(fp, text="Browse…", command=self._pick_outdir,
-                   style="Small.TButton").grid(row=1, column=2, padx=(8, 0), pady=(6, 0))
 
         # ── Info card (hidden until load) ─────────────────────────────────────
         self._card = tk.Frame(main, bg=self._CARD_BG, relief="solid", bd=1)
@@ -2245,15 +2435,6 @@ class App:
     def _set_status(self, msg: str) -> None:
         self.status_var.set(msg)
 
-    def _pick_db(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select Tally SQLite File",
-            filetypes=[("SQLite Database", "*.sqlite *.db"), ("All Files", "*.*")]
-        )
-        if path:
-            self.db_path.set(path)
-            self._load_db()
-
     def _pick_outdir(self) -> None:
         d = filedialog.askdirectory(title="Select Output Folder")
         if d:
@@ -2266,42 +2447,151 @@ class App:
         except ValueError:
             return None
 
-    def _load_db(self) -> None:
-        path = self.db_path.get()
-        if not path or not os.path.isfile(path):
-            return
-        self._set_status("Loading…")
-        self.root.update_idletasks()
+    # ── Branch list management ────────────────────────────────────────────────
+
+    def _refresh_branch_tree(self) -> None:
+        """Rebuild the Treeview from self._branches."""
+        for iid in self._branch_tree.get_children():
+            self._branch_tree.delete(iid)
+        for i, b in enumerate(self._branches):
+            fd = b["fd"]
+            period = f"{fd.period_from} → {fd.period_to}" if fd else "—"
+            company = fd.company if fd else "(load failed)"
+            self._branch_tree.insert(
+                "", "end", iid=str(i),
+                values=(b["name"], company, period, os.path.basename(b["path"])),
+            )
+
+    def _selected_branch_idx(self) -> int | None:
+        sel = self._branch_tree.selection()
+        if not sel:
+            return None
         try:
-            self.fd = load_from_sqlite(
-                path,
-                opening_stock_override=self._parse_stock(self.op_stock.get()),
-                closing_stock_override=self._parse_stock(self.cl_stock.get()),
-            )
-            self._update_card()
-            self._set_status(
-                f"Loaded  {self.fd.company}  |  {self.fd.period_from} → {self.fd.period_to}"
-            )
+            return int(sel[0])
+        except ValueError:
+            return None
+
+    def _add_branch(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Tally SQLite File",
+            filetypes=[("SQLite Database", "*.sqlite *.db"), ("All Files", "*.*")]
+        )
+        if not path:
+            return
+        # Default branch name: prompt user with company name as default
+        default_name = f"Branch {len(self._branches) + 1}"
+        try:
+            preview = load_from_sqlite(path, branch_name=default_name)
+            default_name = preview.company.split()[0] if preview.company else default_name
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
-            self._set_status("Error loading file — see dialog.")
+            return
 
-    def _reload_preview(self) -> None:
-        """Re-load with updated stock overrides and refresh the card."""
-        path = self.db_path.get()
-        if not path or not os.path.isfile(path):
-            messagebox.showwarning("No File", "Select a Tally SQLite file first.")
+        name = self._ask_branch_name(default_name)
+        if name is None:
+            return
+        # Reload with the chosen name so ledgers/pnl_rows are tagged correctly
+        try:
+            fd = load_from_sqlite(path, branch_name=name)
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+            return
+        self._branches.append({"path": path, "name": name, "fd": fd})
+        self._refresh_branch_tree()
+        self._refresh_consolidated()
+        self._set_status(f"Added branch '{name}'. Total branches: {len(self._branches)}.")
+
+    def _rename_branch(self) -> None:
+        idx = self._selected_branch_idx()
+        if idx is None:
+            messagebox.showinfo("Rename Branch", "Select a branch first.")
+            return
+        b = self._branches[idx]
+        new_name = self._ask_branch_name(b["name"])
+        if new_name is None or new_name == b["name"]:
+            return
+        # Re-tag ledgers/pnl_rows with the new branch name
+        b["name"] = new_name
+        if b["fd"] is not None:
+            b["fd"].branch_name = new_name
+            for l in b["fd"].ledgers:
+                l.branch = new_name
+            for p in b["fd"].pnl_rows:
+                p.branch = new_name
+        self._refresh_branch_tree()
+        self._refresh_consolidated()
+
+    def _remove_branch(self) -> None:
+        idx = self._selected_branch_idx()
+        if idx is None:
+            messagebox.showinfo("Remove Branch", "Select a branch first.")
+            return
+        removed = self._branches.pop(idx)
+        self._refresh_branch_tree()
+        self._refresh_consolidated()
+        self._set_status(f"Removed branch '{removed['name']}'.")
+
+    def _ask_branch_name(self, default: str) -> str | None:
+        """Modal popup to enter / edit a branch name. Returns None on cancel."""
+        top = tk.Toplevel(self.root)
+        top.title("Branch Name")
+        top.transient(self.root)
+        top.grab_set()
+        top.configure(bg=self._BG)
+        ttk.Label(top, text="Branch name:").pack(padx=12, pady=(12, 4), anchor="w")
+        var = tk.StringVar(value=default)
+        entry = ttk.Entry(top, textvariable=var, width=32)
+        entry.pack(padx=12, pady=(0, 8))
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        result = {"value": None}
+        def ok():
+            v = var.get().strip()
+            if v:
+                result["value"] = v
+                top.destroy()
+        def cancel():
+            top.destroy()
+
+        btn_row = ttk.Frame(top)
+        btn_row.pack(pady=(4, 12))
+        ttk.Button(btn_row, text="OK", command=ok, style="Small.TButton").pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", command=cancel, style="Small.TButton").pack(side="left", padx=4)
+        entry.bind("<Return>", lambda e: ok())
+        entry.bind("<Escape>", lambda e: cancel())
+        top.wait_window()
+        return result["value"]
+
+    def _refresh_consolidated(self) -> None:
+        """Re-consolidate after a branch list change and refresh the card."""
+        loaded = [b["fd"] for b in self._branches if b["fd"] is not None]
+        if not loaded:
+            self.fd = None
+            self._vr = None
+            self._card.grid_remove()
             return
         try:
-            self.fd = load_from_sqlite(
-                path,
-                opening_stock_override=self._parse_stock(self.op_stock.get()),
-                closing_stock_override=self._parse_stock(self.cl_stock.get()),
-            )
+            self.fd = consolidate_branches(loaded)
+            # Apply stock overrides to the consolidated FD
+            self.fd.opening_stock_override = self._parse_stock(self.op_stock.get())
+            self.fd.closing_stock_override = self._parse_stock(self.cl_stock.get())
             self._update_card()
-            self._set_status("Preview updated.")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        except RuntimeError as e:
+            self.fd = None
+            self._vr = None
+            self._card.grid_remove()
+            messagebox.showerror("Consolidation Error", str(e))
+            self._set_status("Consolidation failed — see dialog.")
+
+    def _reload_preview(self) -> None:
+        """Re-apply stock overrides and refresh the card."""
+        if not self._branches:
+            messagebox.showwarning("No Branches", "Add at least one Tally SQLite file first.")
+            return
+        self._refresh_consolidated()
+        if self.fd is not None:
+            self._set_status("Preview updated with stock overrides.")
 
     def _update_card(self) -> None:
         fd = self.fd
@@ -2394,21 +2684,25 @@ class App:
         ttk.Button(top, text="Close", command=top.destroy).pack(pady=(0, 8))
 
     def _get_fd(self) -> FinancialData | None:
-        path = self.db_path.get()
-        if not path or not os.path.isfile(path):
-            messagebox.showwarning("No File", "Please select a Tally SQLite file first.")
+        """Return the consolidated FinancialData, validating that branches are loaded."""
+        loaded = [b["fd"] for b in self._branches if b["fd"] is not None]
+        if not loaded:
+            messagebox.showwarning("No Branches",
+                                   "Please add at least one Tally SQLite file (one per branch).")
             return None
         try:
-            fd = load_from_sqlite(
-                path,
-                opening_stock_override=self._parse_stock(self.op_stock.get()),
-                closing_stock_override=self._parse_stock(self.cl_stock.get()),
-            )
-            self.fd = fd
-            return fd
-        except Exception as e:
-            messagebox.showerror("Load Error", str(e))
+            fd = consolidate_branches(loaded)
+        except RuntimeError as e:
+            messagebox.showerror("Consolidation Error", str(e))
             return None
+        fd.opening_stock_override = self._parse_stock(self.op_stock.get())
+        fd.closing_stock_override = self._parse_stock(self.cl_stock.get())
+        self.fd = fd
+        return fd
+
+    def _branch_fds(self) -> list[FinancialData]:
+        """Return the per-branch FDs (for side-by-side columns in Excel)."""
+        return [b["fd"] for b in self._branches if b["fd"] is not None]
 
     def _get_proj_inputs(self) -> ProjectionInputs | None:
         try:
@@ -2438,11 +2732,12 @@ class App:
         fd = self._get_fd()
         if fd is None:
             return
+        branches = self._branch_fds()
         out = self._output_path("_Actual")
         self._set_status("Generating Excel…")
         self.root.update_idletasks()
         try:
-            ExcelWriter(fd, proj=None).save(out)
+            ExcelWriter(fd, proj=None, branches=branches).save(out)
             self._set_status(f"Saved: {out}")
             if messagebox.askyesno("Done", f"Excel saved:\n{out}\n\nOpen it now?"):
                 self._open_file(out)
@@ -2457,11 +2752,12 @@ class App:
         proj = self._get_proj_inputs()
         if proj is None:
             return
+        branches = self._branch_fds()
         out = self._output_path("_Full")
         self._set_status("Generating Excel (with projections)…")
         self.root.update_idletasks()
         try:
-            ExcelWriter(fd, proj).save(out)
+            ExcelWriter(fd, proj, branches=branches).save(out)
             self._set_status(f"Saved: {out}")
             if messagebox.askyesno("Done", f"Excel saved:\n{out}\n\nOpen it now?"):
                 self._open_file(out)
@@ -2470,13 +2766,14 @@ class App:
             self._set_status("Generation failed — see error dialog.")
 
     def _clear(self) -> None:
-        self.db_path.set("")
+        self._branches.clear()
+        self._refresh_branch_tree()
         self.op_stock.set("")
         self.cl_stock.set("")
         self.fd   = None
         self._vr  = None
         self._card.grid_remove()
-        self._set_status("Cleared. Select a Tally SQLite file to begin.")
+        self._set_status("Cleared. Add Tally SQLite files to begin.")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
