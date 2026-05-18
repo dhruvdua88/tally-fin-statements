@@ -1,6 +1,6 @@
 # Tally Financial Statements Generator
 
-A standalone Python desktop app that reads a **Tally SQLite export** (produced by the [FinAnalyzer TSF Exporter](https://github.com/dhruvdua88/finanalyzer/tree/main/python-tsf-exporter)) and generates publication-ready **Schedule III financial statements** in Excel — with linked notes, 3-year projections (simple or banker-grade), cash flow, ratios, charts, and a full data-validation report.
+A standalone Python desktop app that reads one or more **Tally SQLite exports** (produced by the [FinAnalyzer TSF Exporter](https://github.com/dhruvdua88/finanalyzer/tree/main/python-tsf-exporter)) and generates publication-ready **Schedule III financial statements** in Excel — with linked notes, 3-year projections (simple or banker-grade), cash flow, ratios, charts, and a full data-validation report. Multiple files are auto-consolidated branch-wise with per-branch columns and a Consolidated total.
 
 > **Requires the new TSF SQLite schema** — exported by the bundled TSF Exporter (v2+). The schema uses `mst_ledger`, `mst_group`, and `_export_info` tables with `closing_balance` stored as TEXT in Tally's native sign convention.
 
@@ -15,6 +15,15 @@ The ZIP contains everything: the app, a one-click Mac launcher, and a one-click 
 ---
 
 ## What's New
+
+### v2.0 — Multi-branch consolidation
+
+- **Add multiple Tally SQLite files** (one per company branch) in the GUI and generate **one Excel workbook** with per-branch columns plus a Consolidated total in the Schedule III Balance Sheet and Statement of P&L.
+- **Source files panel** replaces the single-file picker — a list with **Add Branch…**, **Rename**, and **Remove** buttons. Each branch loads independently, and the consolidated card refreshes on every change.
+- **Side-by-side columns** in BS and P&L: `Particulars | Note | <Branch 1> | <Branch 2> | … | Consolidated`. Notes prefix each ledger with `[BranchName]` to disambiguate identical names across branches.
+- **Period validation** — refuses to consolidate if `period_from` / `period_to` don't match across branches (clear error popup naming the mismatched branches).
+- **Stock overrides** apply to the consolidated total; projections still run on the consolidated data.
+- **Backwards compatible** — load a single file and you get the original single-column layout unchanged.
 
 ### v1.2 — Simple/Detailed projection modes + optional analytics sheets
 
@@ -77,6 +86,7 @@ python financial_statements.py
 
 | Area | Detail |
 |---|---|
+| **Multi-Branch Consolidation** | Load multiple Tally SQLite files (one per branch). Balance Sheet and P&L emit per-branch columns plus a Consolidated total. Periods must match across branches. |
 | **Balance Sheet** | Schedule III format (Indian Companies Act 2013); face cells are formula-linked to note totals; note numbers are clickable hyperlinks |
 | **P&L Statement** | Revenue, purchases, employee costs, finance costs, depreciation, other expenses; key ratios |
 | **Note Sheets** | 9 separate Excel sheets (Share Capital → Cash & Bank), each with a "← Back" link |
@@ -108,8 +118,8 @@ pip install openpyxl
 python financial_statements.py
 ```
 
-1. Click **Browse…** and select your `.sqlite` Tally export file
-2. Optionally enter corrected opening/closing stock values
+1. Click **+ Add Branch…** and select your `.sqlite` Tally export file (give the branch a name when prompted). Repeat for each branch you want to consolidate — all branches must share the same period.
+2. Optionally enter corrected opening/closing stock values (applied to the consolidated total)
 3. Click **Apply & Preview Numbers** to see a live balance-sheet and P&L summary
 4. Check the **Validation** tab for any data-quality warnings
 5. Use the **Group Mapping** tab to assign non-standard Tally groups to Schedule III heads
@@ -126,8 +136,8 @@ The output Excel file is saved to your chosen output folder (default: Desktop). 
 
 | Sheet | Always included? | Contents |
 |---|---|---|
-| `Balance Sheet` | ✓ | Schedule III face — formula-linked to note totals |
-| `P&L Statement` | ✓ | Schedule III face + key financial ratios |
+| `Balance Sheet` | ✓ | Schedule III face — formula-linked to note totals. With ≥2 branches loaded, columns become `Particulars · Note · <Branch1> · <Branch2> · … · Consolidated`. |
+| `P&L Statement` | ✓ | Schedule III face + key financial ratios. Same per-branch + Consolidated column layout when multiple branches are loaded. |
 | `N1 Share Capital` | ✓ | Ledger-level detail |
 | `N2 Reserves Surplus` | ✓ | Reserves & Surplus breakdown |
 | `N3 LT Borrowings` | ✓ | Secured / Unsecured loans by ledger |
@@ -361,7 +371,7 @@ A small settings file (`~/.tallyfin_settings.json`) is created on first run to r
 
 ## Limitations
 
-- **Single company, single period** — one SQLite file = one year's statements
+- **Single period only** — all loaded branches must cover the same `period_from` / `period_to` (mismatched periods are rejected on consolidate). One SQLite file = one year's statements per branch.
 - **No previous-year column** — the "Previous Year" column in the BS face is reserved (requires two exports — planned for a future release)
 - **Simplified tax** — tax expense uses the Deferred Tax Liability ledger as a proxy on the Actual sheets; projections use a flat effective rate
 - **Depreciation from FA schedule** — if Tally has not booked depreciation entries (common when using a separate depreciation workbook), the P&L depreciation line will be zero; add it via a manual adjustment or use the Indirect Expenses sub-group instead
