@@ -2,9 +2,11 @@
 
 ## ⬇ Download
 
-> ### **➡ [Download latest release (ZIP)](https://github.com/dhruvdua88/tally-fin-statements/releases/latest) ⬅**
+> ### **➡ [Download ZIP (direct, always latest)](https://github.com/dhruvdua88/tally-fin-statements/archive/refs/heads/main.zip) ⬅**
 >
-> The ZIP contains the app plus one-click launchers for **Mac** (`run_mac.command`) and **Windows** (`run_windows.bat`). No coding required — see [Install & Run](#install--run-no-coding-needed) below.
+> Clicking the link downloads `tally-fin-statements-main.zip` immediately — no intermediate page. The ZIP contains the app plus one-click launchers for **Mac** (`run_mac.command`) and **Windows** (`run_windows.bat`). No coding required — see [Install & Run](#install--run-no-coding-needed) below.
+>
+> Prefer a tagged release? Browse all versions at [github.com/dhruvdua88/tally-fin-statements/releases](https://github.com/dhruvdua88/tally-fin-statements/releases).
 
 You will also need the companion **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)** to pull data out of TallyPrime — see [How it connects to Tally](#how-it-connects-to-tally).
 
