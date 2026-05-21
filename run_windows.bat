@@ -5,12 +5,12 @@ title Tally Financial Statements Generator
 cls
 echo ============================================================
 echo   Tally Financial Statements Generator
-echo   Schedule III Balance Sheet, P&L, 3-Year Projections
+echo   Schedule III Balance Sheet, P^&L, 3-Year Projections
 echo ============================================================
 echo.
 
 REM ── 1. Check Python ──────────────────────────────────────────────────────────
-python --version >/dev/null 2>&1
+python --version >nul 2>&1
 if errorlevel 1 (
     echo [X]  Python 3.11 or later is not installed.
     echo.
