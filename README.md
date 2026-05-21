@@ -1,51 +1,72 @@
 # Tally Financial Statements Generator
 
-A standalone Python desktop app that reads Tally data exported by the **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)** and generates publication-ready **Schedule III financial statements** in Excel — with linked notes, 3-year projections (simple or banker-grade), cash flow, ratios, charts, and a full data-validation report. Multiple branches are auto-consolidated with per-branch columns and a Consolidated total.
+## ⬇ Download
+
+> ### **➡ [Download latest release (ZIP)](https://github.com/dhruvdua88/tally-fin-statements/releases/latest) ⬅**
+>
+> The ZIP contains the app plus one-click launchers for **Mac** (`run_mac.command`) and **Windows** (`run_windows.bat`). No coding required — see [Install & Run](#install--run-no-coding-needed) below.
+
+You will also need the companion **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)** to pull data out of TallyPrime — see [How it connects to Tally](#how-it-connects-to-tally).
+
+---
+
+## What it does
+
+A standalone Python desktop app that reads Tally data exported by the **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)** and generates **Schedule III financial statements** in Excel:
+
+- **Balance Sheet** and **Statement of P&L** in Indian Companies Act 2013 format, with formula-linked note hyperlinks
+- **9 note schedules** (Share Capital, Reserves, Borrowings, Trade Payables/Receivables, Fixed Assets, Inventories, Cash & Bank)
+- **3-Year Projected P&L and Balance Sheet** with cash-plug method
+- **Validation sheet** — 26 automated checks (BS balance, P&L reconciliation, sign breaches, etc.)
+- **Multi-branch consolidation** — load multiple TSF files, get per-branch columns + a Consolidated total
 
 **Accepts three input formats from the TSF Exporter:**
 - **ZIP file** — the `.zip` produced directly by the TSF Exporter (recommended, one click)
 - **SQLite file** — the `.sqlite` / `.db` extracted from the ZIP
 - **CSV folder** — the folder of `.csv` files inside the ZIP
 
-> The TSF Exporter is a separate Windows app that connects to TallyPrime and exports your data. Run it once per branch/company to get the input files for this app.
-
 ---
 
-## ⬇ Download
+## How it connects to Tally
 
-**[Download latest release (ZIP)](https://github.com/dhruvdua88/tally-fin-statements/releases/latest)**
+This app does **not** speak to TallyPrime directly. It reads files produced by the **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)**, which is the trusted bridge:
 
-The ZIP contains everything: the app, a one-click Mac launcher, and a one-click Windows launcher. No coding required.
+```
+  TallyPrime  ──XML over TCP 9000──▶  TSF Exporter (Node.js + Python)  ──ZIP/CSV/SQLite──▶  This app  ──▶  Excel
+```
+
+**Why two tools?** The TSF Exporter handles all TallyPrime XML/TDL protocol complexity on the Windows machine where Tally runs. This app then works on **any** OS (Mac, Windows, Linux) against the exported files — your auditor or analyst doesn't need Tally running locally.
+
+**For two branches:** run the TSF Exporter once per company/branch in TallyPrime, save the two `.zip` files, then load both into this app. Periods must match across branches.
 
 ---
 
 ## What's New
 
+### v2.1 — ZIP + CSV folder input
+
+- **Accept TSF Exporter ZIP files directly** — no need to unzip first; the app extracts the SQLite into a temp file, loads it, and cleans up.
+- **+ From CSV Folder…** button — load a folder of CSV files (`mst_ledger.csv`, `mst_group.csv`, `_export_info.csv`) when you only have the extracted CSVs.
+- File dialog filters updated to show `.zip` alongside `.sqlite` / `.db`.
+
 ### v2.0 — Multi-branch consolidation
 
-- **Add multiple Tally SQLite files** (one per company branch) in the GUI and generate **one Excel workbook** with per-branch columns plus a Consolidated total in the Schedule III Balance Sheet and Statement of P&L.
-- **Source files panel** replaces the single-file picker — a list with **Add Branch…**, **Rename**, and **Remove** buttons. Each branch loads independently, and the consolidated card refreshes on every change.
+- **Add multiple Tally exports** (one per company branch) in the GUI and generate **one Excel workbook** with per-branch columns plus a Consolidated total in the Schedule III Balance Sheet and Statement of P&L.
+- **Source files panel** with a list and **Add Branch…**, **Rename**, **Remove** buttons. Each branch loads independently.
 - **Side-by-side columns** in BS and P&L: `Particulars | Note | <Branch 1> | <Branch 2> | … | Consolidated`. Notes prefix each ledger with `[BranchName]` to disambiguate identical names across branches.
-- **Period validation** — refuses to consolidate if `period_from` / `period_to` don't match across branches (clear error popup naming the mismatched branches).
+- **Period validation** — refuses to consolidate if `period_from` / `period_to` don't match across branches.
 - **Stock overrides** apply to the consolidated total; projections still run on the consolidated data.
 - **Backwards compatible** — load a single file and you get the original single-column layout unchanged.
 
-### v1.2 — Simple/Detailed projection modes + optional analytics sheets
+### v1.2 — Projection engine fixes + print-ready output
 
-- **Simple projection mode** — only 3 inputs needed (revenue growth, gross margin, tax rate). Working-capital days, OpEx growth, interest and depreciation rates are derived automatically from the base year. Choose Simple or Detailed via a radio on the Projections tab.
-- **Optional Excel sheets** (all toggleable via checkboxes on the Projections tab):
-  - **Ratios** — profitability (Gross/EBITDA/PAT margin, RoE, RoCE), liquidity (Current, Quick), leverage (D/E, Interest Coverage, DSCR), efficiency days (Inventory, Debtor, Creditor)
-  - **Cash Flow Statement** — 3-year, indirect method (CFO + CFI + CFF, with opening/closing cash)
-  - **Common-Size statements** — P&L as % of revenue, Balance Sheet as % of total assets
-  - **Charts** — Revenue / EBITDA / PAT bar chart + PAT-margin trend line
-  - **Banker view** — adds DSCR + Interest Coverage rows directly on the Projected P&L
 - **Projection engine — modelling bugs fixed:**
   - Interest now computed on average LT-borrowings (opening + closing) / 2 — not period-end.
   - CapEx no longer double-counted (mid-year-convention depreciation).
   - Inventory days re-applied every year (was previously frozen after year 0).
   - Cash plug going negative now surfaces as **"Additional Short-Term Borrowing Needed"** in red instead of silently showing negative cash.
 - **Print-ready page setup** on every sheet (A4, fit-to-width, company header, page numbers, date footer).
-- **Settings persistence** — last DB path, output folder, projection inputs, mode, and output options are saved to `~/.tallyfin_settings.json` and restored on next launch.
+- **Settings persistence** — last paths, projection inputs, and output options saved to `~/.tallyfin_settings.json` and restored on next launch.
 
 ### v1.1 — Balance Sheet linking & formatting
 
@@ -91,20 +112,19 @@ python financial_statements.py
 
 | Area | Detail |
 |---|---|
-| **Multi-Branch Consolidation** | Load multiple Tally SQLite files (one per branch). Balance Sheet and P&L emit per-branch columns plus a Consolidated total. Periods must match across branches. |
-| **Balance Sheet** | Schedule III format (Indian Companies Act 2013); face cells are formula-linked to note totals; note numbers are clickable hyperlinks |
-| **P&L Statement** | Revenue, purchases, employee costs, finance costs, depreciation, other expenses; key ratios |
-| **Note Sheets** | 9 separate Excel sheets (Share Capital → Cash & Bank), each with a "← Back" link |
-| **Notes Index** | One-page index of all notes with amounts and hyperlinks |
-| **Projections — Simple Mode** | Just 3 inputs (revenue growth, gross margin, tax rate). Everything else is derived from base year. |
-| **Projections — Detailed Mode** | All 15 banker-grade inputs (working capital days, OpEx growth, interest, CapEx, etc.) |
-| **Optional Analytics** | Ratios sheet · Cash Flow Statement · Common-Size statements · Charts · Banker view (DSCR + Interest Coverage) — all opt-in |
-| **Print-Ready Output** | A4 fit-to-width page setup on every sheet, with company header and page footer |
-| **Validation Report** | 15+ automated checks — BS balance equation, P&L reconciliation, sign flips, natural-sign breaches, stale balances, unclassified groups |
-| **Group Mapping** | Auto-infers Schedule III head for any non-standard Tally primary group; user can override via GUI dropdown |
-| **Stock Overrides** | Opening and closing stock can be corrected without editing Tally |
-| **Settings Persistence** | Remembers last file paths, projection inputs and output options across launches |
-| **GUI** | `tkinter` desktop app — no web server, single `pip install openpyxl` dependency |
+| **Multi-Branch Consolidation** | Load multiple Tally exports (one per branch) as ZIP, SQLite, or CSV folder. Balance Sheet and P&L emit per-branch columns plus a Consolidated total. Periods must match across branches. |
+| **Three Input Formats** | TSF Exporter `.zip` (auto-extracts), `.sqlite` / `.db`, or a folder of CSVs (`mst_ledger.csv`, `mst_group.csv`, `_export_info.csv`). |
+| **Balance Sheet** | Schedule III format (Indian Companies Act 2013); face cells are formula-linked to note totals; note numbers are clickable hyperlinks. |
+| **P&L Statement** | Revenue, purchases, employee costs, finance costs, depreciation, other expenses; inline key ratios (Gross Margin, EBITDA, PAT margin). |
+| **Note Sheets** | 9 separate Excel sheets (Share Capital → Cash & Bank), each with a "← Back" link. |
+| **Notes Index** | One-page index of all notes with amounts and hyperlinks. |
+| **3-Year Projections** | Banker/investor format with 15 inputs (revenue growth Y1/Y2/Y3, gross margin, OpEx growth, working-capital days, loan schedule, interest, CapEx, depreciation, tax rate, other income). Cash-plug method with funding-shortfall flag. |
+| **Print-Ready Output** | A4 fit-to-width page setup on every sheet, with company header and page footer. |
+| **Validation Report** | 26 automated checks — BS balance equation, P&L reconciliation, sign flips, natural-sign breaches, stale balances, unclassified groups, sub-12-month period detection, etc. |
+| **Group Mapping** | Auto-infers Schedule III head for any non-standard Tally primary group (28 keyword rules); user can override via GUI dropdown. |
+| **Stock Overrides** | Opening and closing stock can be corrected without editing Tally. |
+| **Settings Persistence** | Remembers last file paths, projection inputs and output options across launches (`~/.tallyfin_settings.json`). |
+| **GUI** | `tkinter` desktop app — no web server, single `pip install openpyxl` dependency. |
 
 ---
 
@@ -147,7 +167,7 @@ Settings persist — next launch remembers your last files and inputs.
 | Sheet | Always included? | Contents |
 |---|---|---|
 | `Balance Sheet` | ✓ | Schedule III face — formula-linked to note totals. With ≥2 branches loaded, columns become `Particulars · Note · <Branch1> · <Branch2> · … · Consolidated`. |
-| `P&L Statement` | ✓ | Schedule III face + key financial ratios. Same per-branch + Consolidated column layout when multiple branches are loaded. |
+| `P&L Statement` | ✓ | Schedule III face + inline key ratios (Gross Margin, EBITDA, PAT margin). Same per-branch + Consolidated column layout when multiple branches are loaded. |
 | `N1 Share Capital` | ✓ | Ledger-level detail |
 | `N2 Reserves Surplus` | ✓ | Reserves & Surplus breakdown |
 | `N3 LT Borrowings` | ✓ | Secured / Unsecured loans by ledger |
@@ -158,14 +178,10 @@ Settings persist — next launch remembers your last files and inputs.
 | `N12 Trade Receivables` | ✓ | Debtors by parent sub-group |
 | `N13 Cash & Bank` | ✓ | Cash-in-hand + bank accounts (debit-balance only) |
 | `Notes Index` | ✓ | All notes with amounts and hyperlinks |
-| `Validation` | ✓ | Color-coded ERROR / WARNING / INFO check results |
-| `Projected P&L` | If projections enabled | Base year + Years 1–3; can include DSCR + Interest Coverage rows |
+| `Validation` | ✓ | Color-coded ERROR / WARNING / INFO check results (26 checks) |
+| `Projected P&L` | If projections enabled | Base year + Years 1–3 |
 | `Projected Balance Sheet` | If projections enabled | Base year + Years 1–3; shows funding-shortfall flag if cash plug went negative |
 | `Assumptions` | If projections enabled | All projection inputs recorded for audit trail |
-| `Ratios` | **Optional (default ON)** | Profitability, liquidity, leverage, efficiency days |
-| `Cash Flow` | **Optional** | 3-year, indirect method |
-| `Common-Size` | **Optional** | P&L as % of revenue, BS as % of total assets |
-| `Charts` | **Optional (default ON)** | Revenue/EBITDA/PAT bar chart + PAT-margin line |
 
 Every note sheet has a **← Back to Balance Sheet** hyperlink in cell A2. The file opens on the Balance Sheet.
 
@@ -301,18 +317,7 @@ current year profit    = pnl_balance - pnl_opening
 
 ## Projection Engine
 
-The 3-year projection uses a **cash-plug balance sheet** method, with two modes:
-
-### Simple Mode (recommended for quick estimates)
-Only three inputs required — everything else is derived from the base year:
-- Revenue Growth Y1/Y2/Y3 (%)
-- Gross Margin (%)
-- Effective Tax Rate (%)
-
-Inventory days, debtor days, creditor days are auto-computed from base-year ratios; OpEx growth = minimum of revenue growth; interest rate defaults to 12 %; depreciation rate defaults to 15 %.
-
-### Detailed Mode (for banker submissions)
-Full control over all 15 levers:
+The 3-year projection uses a **cash-plug balance sheet** method. All 15 levers are exposed in the GUI with sensible defaults — fill in what matters for your case and leave the rest as-is:
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -340,7 +345,7 @@ Full control over all 15 levers:
 
 ## Validation Checks
 
-The app runs 15+ automated checks on every load:
+The app runs **26 automated checks** on every load:
 
 | Category | Check | Severity |
 |---|---|---|
@@ -363,6 +368,28 @@ The app runs 15+ automated checks on every load:
 | Data Quality | Large stale balances (≥₹1L, no movement) | INFO |
 
 Results appear in the **Validation** tab in the GUI and in the **Validation** sheet in the Excel output (color-coded red / amber / green).
+
+---
+
+## How robust are the statements?
+
+The TSF Exporter + this app combination is designed to produce statements that match Tally's own reports:
+
+**What is enforced:**
+- Schema validation rejects malformed inputs before any computation runs
+- P&L numbers come from `mst_ledger.closing_balance` (the same source Tally's P&L report uses) — not `trn_accounting`, which includes inter-branch and journal entries Tally excludes
+- BS face cells are formula-linked to note totals, so the printed Balance Sheet always reconciles with its notes
+- Sign convention is handled in one place (`safe_float`) for both Indian-comma format and `Cr` / `Dr` suffixes
+- Periods must match across branches before consolidation runs
+- 26 post-load checks flag the common Tally pitfalls (BS not balancing, P&L not reconciling with the P&L A/c ledger, missing depreciation, stock anomalies, mis-classified groups)
+
+**What still depends on you:**
+- The TSF Exporter must have run cleanly against a closed period in Tally (mid-year exports get a sub-12-month warning, not an error)
+- Tally's group hierarchy should follow the standard (`Sales Accounts`, `Bank Accounts`, etc.) — non-standard groups get auto-inferred via 28 keyword rules, but you can override in the GUI
+- Tax expense uses the Deferred Tax Liability ledger as a proxy on Actuals; complex tax workings need a manual adjustment
+- Depreciation comes from the Fixed Assets schedule in Tally — if your firm uses an external depreciation workbook, that line will be zero unless booked back in
+
+In short: the data path is well-validated, but the source data must reflect a year-end book close. The Validation sheet tells you when it doesn't.
 
 ---
 
