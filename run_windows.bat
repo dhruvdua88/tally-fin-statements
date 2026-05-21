@@ -9,7 +9,7 @@ echo   Schedule III Balance Sheet, P^&L, 3-Year Projections
 echo ============================================================
 echo.
 
-REM ── 1. Check Python ──────────────────────────────────────────────────────────
+REM --- 1. Check Python --------------------------------------------------------
 python --version >nul 2>&1
 if errorlevel 1 (
     echo [X]  Python 3.11 or later is not installed.
@@ -29,7 +29,7 @@ for /f "tokens=*" %%v in ('python --version 2^>^&1') do set PY_VER=%%v
 echo [OK] %PY_VER% found.
 echo.
 
-REM ── 2. Create / reuse virtual environment ────────────────────────────────────
+REM --- 2. Create / reuse virtual environment ---------------------------------
 if not exist ".venv\" (
     echo [..] Creating virtual environment (first-time, ~10 seconds)...
     python -m venv .venv
@@ -44,7 +44,7 @@ if not exist ".venv\" (
 )
 echo.
 
-REM ── 3. Install / upgrade dependencies ────────────────────────────────────────
+REM --- 3. Install / upgrade dependencies -------------------------------------
 echo [..] Installing packages (openpyxl)...
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip --quiet
@@ -57,8 +57,8 @@ if errorlevel 1 (
 echo [OK] Packages ready.
 echo.
 
-REM ── 4. Launch ────────────────────────────────────────────────────────────────
-echo [>>] Starting app — this window can be closed once it opens.
+REM --- 4. Launch -------------------------------------------------------------
+echo [^>^>] Starting app - this window can be closed once it opens.
 echo.
 python financial_statements.py
 
