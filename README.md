@@ -1,8 +1,13 @@
 # Tally Financial Statements Generator
 
-A standalone Python desktop app that reads one or more **Tally SQLite exports** (produced by the [FinAnalyzer TSF Exporter](https://github.com/dhruvdua88/finanalyzer/tree/main/python-tsf-exporter)) and generates publication-ready **Schedule III financial statements** in Excel — with linked notes, 3-year projections (simple or banker-grade), cash flow, ratios, charts, and a full data-validation report. Multiple files are auto-consolidated branch-wise with per-branch columns and a Consolidated total.
+A standalone Python desktop app that reads Tally data exported by the **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)** and generates publication-ready **Schedule III financial statements** in Excel — with linked notes, 3-year projections (simple or banker-grade), cash flow, ratios, charts, and a full data-validation report. Multiple branches are auto-consolidated with per-branch columns and a Consolidated total.
 
-> **Requires the new TSF SQLite schema** — exported by the bundled TSF Exporter (v2+). The schema uses `mst_ledger`, `mst_group`, and `_export_info` tables with `closing_balance` stored as TEXT in Tally's native sign convention.
+**Accepts three input formats from the TSF Exporter:**
+- **ZIP file** — the `.zip` produced directly by the TSF Exporter (recommended, one click)
+- **SQLite file** — the `.sqlite` / `.db` extracted from the ZIP
+- **CSV folder** — the folder of `.csv` files inside the ZIP
+
+> The TSF Exporter is a separate Windows app that connects to TallyPrime and exports your data. Run it once per branch/company to get the input files for this app.
 
 ---
 
@@ -107,28 +112,33 @@ python financial_statements.py
 
 - Python 3.11+
 - `openpyxl` — `pip install openpyxl`
-- A Tally SQLite export produced by the TSF Exporter (see [TSF Schema](#tsf-schema) below)
+- A Tally export produced by the **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)** (ZIP, SQLite, or CSV folder)
 
 ---
 
 ## Quick Start
+
+### Step 1 — Export from TallyPrime (using TSF Exporter)
+
+1. Download and run the **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)** on the computer running TallyPrime
+2. Select your date range and click **Run export** — it produces a `.zip` file
+3. For **two branches** (e.g. two companies or offices): run the TSF Exporter once for each and save two separate `.zip` files
+
+### Step 2 — Generate statements
 
 ```bash
 pip install openpyxl
 python financial_statements.py
 ```
 
-1. Click **+ Add Branch…** and select your `.sqlite` Tally export file (give the branch a name when prompted). Repeat for each branch you want to consolidate — all branches must share the same period.
-2. Optionally enter corrected opening/closing stock values (applied to the consolidated total)
-3. Click **Apply & Preview Numbers** to see a live balance-sheet and P&L summary
-4. Check the **Validation** tab for any data-quality warnings
-5. Use the **Group Mapping** tab to assign non-standard Tally groups to Schedule III heads
-6. On the **3-Year Projections** tab:
-   - Pick **Simple** mode (3 inputs) or **Detailed** mode (15 inputs)
-   - Tick the optional sheets you want (Ratios, Cash Flow, Charts, Common-Size, Banker view)
-   - Click **Generate Projected + Actual (All Sheets)** or **Projections Only**
+1. Click **+ Add Branch…**, select your `.zip` file (or `.sqlite` / `.db` if you extracted it). Give the branch a name when prompted.
+2. For two branches: click **+ Add Branch…** again and load the second `.zip`. Both branches must cover the same period.
+   - *Have only CSV files?* Use **+ From CSV Folder…** instead and select the folder that contains `mst_ledger.csv`.
+3. Optionally enter corrected opening/closing stock values
+4. Click **Generate Statements (Excel)** — the file lands on your Desktop (or chosen folder)
+5. For projections: fill in the 3-Year Projections section and click **Generate + 3-Year Projections**
 
-The output Excel file is saved to your chosen output folder (default: Desktop). Settings persist — next launch remembers your last selection.
+Settings persist — next launch remembers your last files and inputs.
 
 ---
 
@@ -163,7 +173,9 @@ Every note sheet has a **← Back to Balance Sheet** hyperlink in cell A2. The f
 
 ## TSF Schema
 
-The app reads Tally data exported via the **TSF Exporter** tool (in `../python-tsf-exporter/`). The SQLite file must contain:
+The app reads Tally data exported by the **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)**.  
+It accepts the ZIP directly, or a SQLite / CSV folder extracted from it.  
+The data must contain:
 
 ### Required tables
 

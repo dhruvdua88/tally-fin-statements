@@ -9,9 +9,12 @@ Reads a Tally SQLite export and produces:
 Run:  python financial_statements.py
 Requires: openpyxl  (pip install openpyxl)
 """
+import csv
 import os
 import sqlite3
+import tempfile
 import tkinter as tk
+import zipfile
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from datetime import date
@@ -725,6 +728,75 @@ def validate_financial_data(fd: "FinancialData") -> ValidationResult:
                 f"Examples: {examples}")
 
     return vr
+
+
+# ─── ZIP / CSV helpers ────────────────────────────────────────────────────────
+
+def extract_sqlite_from_zip(zip_path: str) -> str:
+    """Extract the SQLite database from a TSF Exporter ZIP to a temp file.
+
+    Returns the temp file path.  Caller must delete the file when done.
+    Raises RuntimeError if no SQLite is found in the archive.
+    """
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        db_entries = [
+            n for n in zf.namelist()
+            if n.lower().endswith(('.sqlite', '.db'))
+            and not n.startswith('__MACOSX/')
+        ]
+        if not db_entries:
+            raise RuntimeError(
+                "No SQLite file found inside the ZIP.\n"
+                "Select the .zip file produced by the TSF Exporter."
+            )
+        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
+        tmp.write(zf.read(db_entries[0]))
+        tmp.close()
+        return tmp.name
+
+
+def csv_folder_to_sqlite(folder: str) -> str:
+    """Import TSF Exporter CSV files from *folder* into a temp SQLite file.
+
+    Looks for mst_ledger.csv, mst_group.csv, _export_info.csv (and optional
+    trn_accounting.csv / trn_voucher.csv).  Returns the temp file path.
+    Caller must delete the file when done.
+    """
+    folder_path = Path(folder)
+    required = {'mst_ledger', 'mst_group'}
+    missing = [t for t in required if not (folder_path / f"{t}.csv").exists()]
+    if missing:
+        raise RuntimeError(
+            f"Required CSV file(s) not found in the selected folder:\n"
+            f"  {', '.join(f'{t}.csv' for t in missing)}\n\n"
+            "Select the folder that contains mst_ledger.csv and mst_group.csv "
+            "(the folder produced by the TSF Exporter)."
+        )
+    tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
+    tmp.close()
+    con = sqlite3.connect(tmp.name)
+    try:
+        for table_name in ('mst_ledger', 'mst_group', '_export_info',
+                           'trn_accounting', 'trn_voucher'):
+            csv_file = folder_path / f"{table_name}.csv"
+            if not csv_file.exists():
+                continue
+            with open(csv_file, newline='', encoding='utf-8-sig') as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if not headers:
+                    continue
+                cols = [h.strip() for h in headers]
+                cols_def = ', '.join(f'"{c}" TEXT' for c in cols)
+                con.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols_def})')
+                placeholders = ', '.join('?' * len(cols))
+                con.executemany(
+                    f'INSERT INTO "{table_name}" VALUES ({placeholders})', reader
+                )
+        con.commit()
+    finally:
+        con.close()
+    return tmp.name
 
 
 # ─── Database loader ──────────────────────────────────────────────────────────
@@ -2272,6 +2344,8 @@ class App:
         btn_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(btn_row, text="+ Add Branch…", command=self._add_branch,
                    style="Small.TButton").pack(side="left")
+        ttk.Button(btn_row, text="+ From CSV Folder…", command=self._add_branch_from_csv,
+                   style="Small.TButton").pack(side="left", padx=(6, 0))
         ttk.Button(btn_row, text="Rename", command=self._rename_branch,
                    style="Small.TButton").pack(side="left", padx=(6, 0))
         ttk.Button(btn_row, text="Remove", command=self._remove_branch,
@@ -2473,30 +2547,76 @@ class App:
 
     def _add_branch(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select Tally SQLite File",
-            filetypes=[("SQLite Database", "*.sqlite *.db"), ("All Files", "*.*")]
+            title="Select Tally Export (SQLite or TSF Exporter ZIP)",
+            filetypes=[
+                ("All supported", "*.sqlite *.db *.zip"),
+                ("SQLite Database", "*.sqlite *.db"),
+                ("TSF Exporter ZIP", "*.zip"),
+                ("All Files", "*.*"),
+            ]
         )
         if not path:
             return
-        # Default branch name: prompt user with company name as default
+        self._load_branch_from_path(path)
+
+    def _add_branch_from_csv(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Select Folder Containing TSF CSV Files (mst_ledger.csv etc.)"
+        )
+        if not folder:
+            return
+        try:
+            sqlite_path = csv_folder_to_sqlite(folder)
+        except Exception as e:
+            messagebox.showerror("CSV Import Error", str(e))
+            return
+        self._finish_load_branch(sqlite_path, display_path=folder, cleanup=True)
+
+    def _load_branch_from_path(self, path: str) -> None:
+        if path.lower().endswith('.zip'):
+            try:
+                sqlite_path = extract_sqlite_from_zip(path)
+            except Exception as e:
+                messagebox.showerror("ZIP Error", str(e))
+                return
+            self._finish_load_branch(sqlite_path, display_path=path, cleanup=True)
+        else:
+            self._finish_load_branch(path, display_path=path, cleanup=False)
+
+    def _finish_load_branch(self, sqlite_path: str, display_path: str,
+                            cleanup: bool) -> None:
         default_name = f"Branch {len(self._branches) + 1}"
         try:
-            preview = load_from_sqlite(path, branch_name=default_name)
+            preview = load_from_sqlite(sqlite_path, branch_name=default_name)
             default_name = preview.company.split()[0] if preview.company else default_name
         except Exception as e:
+            if cleanup:
+                try: os.unlink(sqlite_path)
+                except OSError: pass
             messagebox.showerror("Load Error", str(e))
             return
 
         name = self._ask_branch_name(default_name)
         if name is None:
+            if cleanup:
+                try: os.unlink(sqlite_path)
+                except OSError: pass
             return
-        # Reload with the chosen name so ledgers/pnl_rows are tagged correctly
+
         try:
-            fd = load_from_sqlite(path, branch_name=name)
+            fd = load_from_sqlite(sqlite_path, branch_name=name)
         except Exception as e:
+            if cleanup:
+                try: os.unlink(sqlite_path)
+                except OSError: pass
             messagebox.showerror("Load Error", str(e))
             return
-        self._branches.append({"path": path, "name": name, "fd": fd})
+
+        if cleanup:
+            try: os.unlink(sqlite_path)
+            except OSError: pass
+
+        self._branches.append({"path": display_path, "name": name, "fd": fd})
         self._refresh_branch_tree()
         self._refresh_consolidated()
         self._set_status(f"Added branch '{name}'. Total branches: {len(self._branches)}.")
