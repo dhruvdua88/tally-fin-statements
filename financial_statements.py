@@ -1364,12 +1364,19 @@ def _font(bold=False, size=10, color=C_BLACK, name="Calibri") -> Font:
 def _align(h="left", v="center", wrap=False) -> Alignment:
     return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
 
-INR = '#,##0'          # Indian number format (openpyxl uses comma-separated)
+INR = '#,##0'          # plain thousands grouping
 INR2 = '#,##0.00'
 # Accounting-style: positive shown plain, negatives in parens, zero as em-dash.
-# Used on the Balance Sheet face so net-debit liabilities (now shown signed)
-# read naturally without minus signs.
+# Used on rows that can legitimately be negative (the reconciliation plug, the
+# BS-difference proof row, contra breakdown lines) where the parenthesis and
+# em-dash treatment reads more naturally than the Indian-grouping format below.
 INR_ACC = '#,##0;(#,##0);"–"'
+# True Indian digit grouping (lakh/crore): renders 1,23,45,678 instead of the
+# Western 12,345,678. Excel allows conditions only in the first two sections, so
+# numbers below ₹1 lakh fall through to plain grouping (identical up to 5 digits)
+# and negatives below ₹1 lakh show with a leading minus — acceptable on the BS
+# face, which is overwhelmingly large positive figures.
+INR_IND = r'[>=10000000]#\,##\,##\,##0;[>=100000]#\,##\,##0;#,##0'
 
 def _fmt(ws, cell_ref: str, value: float | None, italic: bool = False) -> None:
     cell = ws[cell_ref]
@@ -1518,6 +1525,10 @@ class ExcelWriter:
         side_thin = Side(style="thin", color=C_DARK_BLUE)
         side_med  = Side(style="medium", color=C_DARK_BLUE)
         total_border = Border(top=side_thin, bottom=side_med)
+        # Faint hairline under each line item so the eye can track a row across
+        # the (potentially many) branch columns without heavy gridlines.
+        row_rule = Border(bottom=Side(style="hair", color="D9E2EC"))
+        num_align = Alignment(horizontal="right", vertical="center", indent=1)
 
         r = 1
         def header(text, bg=C_HEADER_BG, fg=C_WHITE, sz=12, bold=True, height=None):
@@ -1568,9 +1579,11 @@ class ExcelWriter:
         def _value_for(branch_fd: FinancialData, fn) -> float:
             return fn(branch_fd)
 
-        def row(label, amount_fn, note=None, indent=0, bold=False, total=False, fmt=INR_ACC):
+        def row(label, amount_fn, note=None, indent=0, bold=False, total=False, fmt=INR_IND):
             """amount_fn: callable(FinancialData)->float, or None to leave blank."""
             nonlocal r
+            ws.row_dimensions[r].height = 17
+            value_cols = (bcols if multi else ["C"]) + ([tcol] if multi else [])
             # Indent inside the cell only; label already uses "  a)  " etc.
             ws[f"A{r}"].value = ("  " * indent) + label
             ws[f"A{r}"].font = _font(bold=bold or total, size=10)
@@ -1582,30 +1595,29 @@ class ExcelWriter:
                 ws[f"B{r}"].font = Font(name="Calibri", size=9, color="1D4ED8", underline="single")
                 ws[f"B{r}"].alignment = _align("center")
             if amount_fn is not None:
-                if multi:
-                    for i, b in enumerate(self.branches):
-                        cell = ws[f"{bcols[i]}{r}"]
-                        cell.value = _value_for(b, amount_fn)
-                        cell.number_format = fmt
-                        cell.font = _font(bold=bold or total, size=10)
-                        cell.alignment = _align("right")
-                cell = ws[f"{tcol}{r}"]
-                cell.value = _value_for(fd, amount_fn)
-                cell.number_format = fmt
-                cell.font = _font(bold=bold or total, size=10)
-                cell.alignment = _align("right")
+                for col in value_cols:
+                    src = fd if col == tcol else self.branches[bcols.index(col)]
+                    cell = ws[f"{col}{r}"]
+                    cell.value = _value_for(src, amount_fn)
+                    cell.number_format = fmt
+                    cell.font = _font(bold=bold or total, size=10)
+                    cell.alignment = num_align
             if total:
-                value_cols = (bcols if multi else ["C"]) + ([tcol] if multi else [])
                 ws[f"A{r}"].fill = _fill(C_TOTAL_BG)
                 for col in value_cols:
                     ws[f"{col}{r}"].fill = _fill(C_TOTAL_BG)
                     ws[f"{col}{r}"].border = total_border
+            else:
+                # Faint separator under ordinary line items only.
+                for col in ["A", "B"] + value_cols:
+                    ws[f"{col}{r}"].border = row_rule
             r += 1
             return r - 1
 
-        def formula_row(label, ref_rows, bold=False, total=False, fmt=INR_ACC, op="+"):
+        def formula_row(label, ref_rows, bold=False, total=False, fmt=INR_IND, op="+"):
             """Writes a formula = ref_rows[0] op ref_rows[1] op ... in each value column."""
             nonlocal r
+            ws.row_dimensions[r].height = 17
             ws[f"A{r}"].value = label
             ws[f"A{r}"].font = _font(bold=bold or total, size=10)
             value_cols = (bcols if multi else ["C"]) + ([tcol] if multi else [])
@@ -1614,7 +1626,7 @@ class ExcelWriter:
                 cell.value = "=" + op.join(f"{col}{rr}" for rr in ref_rows)
                 cell.number_format = fmt
                 cell.font = _font(bold=bold or total, size=10)
-                cell.alignment = _align("right")
+                cell.alignment = num_align
             if total:
                 ws[f"A{r}"].fill = _fill(C_TOTAL_BG)
                 for col in value_cols:
@@ -1751,7 +1763,7 @@ class ExcelWriter:
         # the BS always closes to zero on the face. The Validation sheet
         # flags it if the magnitude exceeds 1% of Total Assets.
         recon_r = row("  f)  Year-end Reconciliation  (auto-balance)",
-                      lambda b: b.bs_reconciliation())
+                      lambda b: b.bs_reconciliation(), fmt=INR_ACC)
         # Render in muted italic so it reads as a non-substantive plug line
         for col in ["A"] + (bcols if multi else ["C"]) + ([tcol] if multi else []):
             ws[f"{col}{recon_r}"].font = Font(italic=True, size=9, color="6B6B6B", name="Calibri")
@@ -1819,9 +1831,9 @@ class ExcelWriter:
             v = ws[f"{col}{diff_r}"].value
             if isinstance(v, (int, float)):
                 if abs(v) > 1:
-                    ws[f"{col}{diff_r}"].fill = _fill("FF0000")
+                    ws[f"{col}{diff_r}"].fill = _fill("C0392B")
                     ws[f"{col}{diff_r}"].font = Font(bold=True, size=10, color=C_WHITE, name="Calibri")
-                    ws[f"A{diff_r}"].fill = _fill("FF0000")
+                    ws[f"A{diff_r}"].fill = _fill("C0392B")
                     ws[f"A{diff_r}"].font = Font(bold=True, size=10, color=C_WHITE, name="Calibri")
                 else:
                     ws[f"{col}{diff_r}"].fill = _fill("C6EFCE")   # accounting-green
@@ -1830,9 +1842,13 @@ class ExcelWriter:
                     ws[f"A{diff_r}"].font = Font(bold=True, size=10, color="006100", name="Calibri")
         spacer(); spacer()
 
-        ws.freeze_panes = "A6"
-        # Print page setup — A4 portrait, fit-to-width, repeat header on each page
-        ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
+        # Pin the Particulars + Note columns (A, B) as well as the header rows,
+        # so labels stay visible when scrolling across many branch columns.
+        ws.freeze_panes = "C6"
+        # Print page setup — fit-to-width, repeat header on each page. Use
+        # landscape for the wide multi-branch layout, portrait otherwise.
+        ws.page_setup.orientation = (ws.ORIENTATION_LANDSCAPE if multi
+                                     else ws.ORIENTATION_PORTRAIT)
         ws.page_setup.paperSize  = ws.PAPERSIZE_A4
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
