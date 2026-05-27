@@ -6,6 +6,8 @@ name: Build downloadable apps
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -70,9 +72,18 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-      - name: Attach to Release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish to Release (creates tag + release on first run)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v2.2.0
+          name: "Tally Financial Statements — latest build"
+          body: |
+            Ready-to-run desktop app. No Python or setup required.
+
+            - **Windows:** download `Tally-FinStatements-Windows.zip`, unzip, double-click `TallyFinStatements.exe`.
+            - **Mac:** download `Tally-FinStatements-Mac.zip`, unzip, right-click `TallyFinStatements.app` → Open.
+
+            These files are rebuilt automatically from the latest `main`.
+          make_latest: true
           files: ${{ matrix.artifact }}
           fail_on_unmatched_files: true
