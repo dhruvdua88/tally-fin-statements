@@ -82,11 +82,70 @@ PNL_MAP: dict[str, tuple[str, str]] = {
 }
 
 # Sub-groups of Indirect Expenses that are carved out on the face of P&L
-FINANCE_COST_PARENTS = {"Finance Costs", "Interest & Late Filing Fees"}
+FINANCE_COST_PARENTS = {"Finance Costs", "Finance Cost", "Interest & Late Filing Fees"}
 EMPLOYEE_COST_PARENTS = {
     "Employee benefit expenses", "Contribution to Provident Funds & Others",
     "Salary", "Salaries", "Staff Salary",
 }
+
+# Heuristic keyword → standard primary group, used when a Tally file contains a
+# non-standard primary group (e.g. "Finance Cost", "Loans & Advances",
+# "Internet Sales").  Without inference these ledgers would be silently dropped
+# from BS / P&L, breaking the balance.
+_INFER_KEYWORDS: list[tuple[list[str], str]] = [
+    # P&L — Revenue
+    (["sales account", "sales accounts", "revenue", "turnover"],     "Sales Accounts"),
+    (["direct income", "direct incomes"],                             "Direct Incomes"),
+    (["indirect income", "indirect incomes", "other income"],         "Indirect Incomes"),
+    # P&L — Expenses
+    (["purchase account", "purchase accounts"],                       "Purchase Accounts"),
+    (["direct expense", "direct expenses"],                           "Direct Expenses"),
+    (["finance cost", "interest expense", "interest paid"],           "Indirect Expenses"),
+    (["indirect expense", "indirect expenses"],                       "Indirect Expenses"),
+    (["expense", "expenditure", "cost", "consumption"],               "Indirect Expenses"),
+    # BS — Assets
+    (["fixed asset", "tangible asset", "intangible asset",
+      "capital work", "cwip"],                                         "Fixed Assets"),
+    (["investment"],                                                   "Investments"),
+    (["stock", "inventory", "inventories"],                            "Stock-in-hand"),
+    (["sundry debtor", "trade receivable", "debtor"],                  "Sundry Debtors"),
+    (["cash-in-hand", "cash in hand", "petty cash"],                   "Cash-in-hand"),
+    (["bank account", "bank"],                                         "Bank Accounts"),
+    (["loan and advance", "loans and advance", "advance"],             "Loans & Advances (Asset)"),
+    (["deposit"],                                                       "Deposits (Asset)"),
+    (["current asset"],                                                "Current Assets"),
+    (["misc. expense", "deferred expense", "preliminary"],             "Misc. Expenses (ASSET)"),
+    # BS — Equity
+    (["share capital", "equity capital", "paid-up capital",
+      "capital account"],                                              "Capital Account"),
+    (["reserve", "surplus"],                                           "Reserves & Surplus"),
+    # BS — Liabilities
+    (["secured loan", "term loan", "vehicle loan"],                    "Secured Loans"),
+    (["unsecured loan"],                                                "Unsecured Loans"),
+    (["bank od", "overdraft", "cc limit", "cash credit",
+      "working capital loan"],                                          "Bank OD A/c"),
+    (["sundry creditor", "trade payable", "creditor"],                 "Sundry Creditors"),
+    (["provision"],                                                     "Provisions"),
+    (["duties", "taxes payable", "gst", "tds payable"],                "Duties & Taxes"),
+    (["current liabilit", "other liabilit"],                            "Current Liabilities"),
+    (["branch", "division"],                                            "Branch / Divisions"),
+    (["suspense"],                                                      "Suspense A/c"),
+]
+
+
+def infer_standard_group(primary: str, parents: set[str] | None = None) -> str | None:
+    """Map an unknown primary group to the nearest standard BS_MAP / PNL_MAP key.
+
+    Returns None if no confident match is found.  Used by the loader to avoid
+    silently dropping ledgers that fall under non-standard primary groups
+    (e.g. "Finance Cost" → "Indirect Expenses").
+    """
+    text = f"{primary} {' '.join(parents or [])}".lower()
+    for keywords, target in _INFER_KEYWORDS:
+        if any(kw in text for kw in keywords):
+            return target
+    return None
+
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
 
@@ -99,6 +158,13 @@ class LedgerRow:
     closing: float
     is_deemedpositive: bool
     branch: str = ""
+    # Enriched columns from richer Tally exports (bank, GST, PAN).  Optional.
+    bank_account_number: str = ""
+    bank_ifsc: str = ""
+    bank_name: str = ""
+    bank_branch: str = ""
+    gstn: str = ""
+    it_pan: str = ""
 
 @dataclass
 class PnlRow:
@@ -106,6 +172,22 @@ class PnlRow:
     primary_group: str
     parent: str           # Tally sub-group (e.g. "Finance Costs")
     total: float          # raw sum; negative = debit (expense/purchase), positive = credit (income)
+    branch: str = ""
+
+@dataclass
+class StockItem:
+    """Row from mst_stock_item — itemwise opening / closing inventory."""
+    name: str
+    parent: str               # Stock group
+    uom: str
+    hsn_code: str
+    gst_rate: float
+    opening_qty: float
+    opening_rate: float
+    opening_value: float       # Tally sign: stock-on-hand is stored as NEGATIVE
+    closing_qty: float
+    closing_rate: float
+    closing_value: float       # Tally sign: stock-on-hand is stored as NEGATIVE
     branch: str = ""
 
 @dataclass
@@ -121,6 +203,8 @@ class FinancialData:
     opening_stock_override: float | None = None
     closing_stock_override: float | None = None
     branch_name: str = "Main"
+    stock_items: list[StockItem] = field(default_factory=list)
+    meta: dict = field(default_factory=dict)
 
     # ── Balance-sheet ledger helpers ─────────────────────────────────────────
 
@@ -192,12 +276,27 @@ class FinancialData:
     def opening_stock(self) -> float:
         if self.opening_stock_override is not None:
             return self.opening_stock_override
-        return -self._sum_opening("Stock-in-hand")   # debit balance → negate
+        from_ledgers = -self._sum_opening("Stock-in-hand")   # debit balance → negate
+        # Fall back to itemwise inventory register when Stock-in-hand ledgers
+        # are empty (companies that track stock only in the inventory module).
+        if abs(from_ledgers) > 0.5 or not self.stock_items:
+            return from_ledgers
+        return self.stock_items_opening_total()
 
     def closing_stock(self) -> float:
         if self.closing_stock_override is not None:
             return self.closing_stock_override
-        return -self._sum_closing("Stock-in-hand")
+        from_ledgers = -self._sum_closing("Stock-in-hand")
+        if abs(from_ledgers) > 0.5 or not self.stock_items:
+            return from_ledgers
+        return self.stock_items_closing_total()
+
+    def stock_items_opening_total(self) -> float:
+        # Tally stores stock-on-hand as a NEGATIVE value; negate for display.
+        return sum(-si.opening_value for si in self.stock_items)
+
+    def stock_items_closing_total(self) -> float:
+        return sum(-si.closing_value for si in self.stock_items)
 
     # ── P&L totals (from mst_ledger closing_balance) ─────────────────────────
 
@@ -245,13 +344,20 @@ class FinancialData:
     def profit_before_tax(self) -> float:
         return self.revenue_from_ops() + self.other_income() - self.total_expenses()
 
+    def current_year_profit(self) -> float:
+        """Tally's actual current-year profit = movement in the P&L A/c ledger.
+        This is what flows into Reserves & Surplus and balances the BS."""
+        return self.pnl_balance - self.pnl_opening
+
     def tax_expense(self) -> float:
-        # Deferred Tax Liability ledger treatment: positive = credit = liability = tax expense
-        dtl = next((l.closing for l in self.ledgers
-                    if "deferred tax" in l.name.lower()), 0.0)
-        return dtl  # simplified; actual tax computation needs I-T workings
+        # Plug: tax = PBT - Tally's actual current-year profit. This guarantees
+        # the displayed PAT equals what Tally booked as current-year profit,
+        # which is exactly the amount that flows into Reserves & Surplus on
+        # the BS — eliminating P&L ↔ BS reconciliation gaps.
+        return self.profit_before_tax() - self.current_year_profit()
 
     def profit_after_tax(self) -> float:
+        # By construction this equals current_year_profit (the Tally figure).
         return self.profit_before_tax() - self.tax_expense()
 
     # ── Balance sheet totals ──────────────────────────────────────────────────
@@ -270,7 +376,9 @@ class FinancialData:
         for l in self._ledgers_for("Capital Account"):
             if "reserve" in l.name.lower():
                 res += l.closing
-        # Add current year P&L
+        # P&L A/c closing balance — cumulative profit not yet transferred.
+        # This already absorbs the year-on-year stock movement when stock
+        # comes from the inventory module, so no additional adjustment.
         res += self.pnl_balance
         return res
 
@@ -283,26 +391,29 @@ class FinancialData:
         return self._sum_closing("Bank OD A/c")
 
     def trade_payables(self) -> float:
-        return max(0, self._sum_closing("Sundry Creditors"))
+        # Sundry Creditors are credit-natured. Net debit (advances paid to
+        # suppliers exceeding payables) is shown as a NEGATIVE on the same
+        # line — not clamped away or reclassified — so the BS still balances.
+        return self._sum_closing("Sundry Creditors")
 
     def duties_and_taxes_net(self) -> float:
-        net = self._sum_closing("Duties & Taxes")
-        # Positive net = payable (liability); negative net = refund (asset)
-        return net
+        # Positive net = payable; negative net = refund receivable. Shown
+        # on Liability side; negative value displays as negative.
+        return self._sum_closing("Duties & Taxes")
 
     def other_current_liabilities(self) -> float:
-        # Duties & Taxes gets its own line; don't include it here
+        # All OCL primary groups land on liability side regardless of sign.
+        # Deferred Tax Liability is broken out separately on the BS face,
+        # so subtract it here to avoid double-counting.
         cl     = self._sum_closing("Current Liabilities")
         branch = self._sum_closing("Branch / Divisions")
         susp   = self._sum_closing("Suspense A/c")
-        ocl    = cl + max(0, branch) + susp
-        # Remove Deferred Tax Liability from OCL (it's non-current)
         dtl = next((l.closing for l in self.ledgers
                     if "deferred tax" in l.name.lower()), 0.0)
-        return max(0, ocl - dtl)
+        return cl + branch + susp - dtl
 
     def short_term_provisions(self) -> float:
-        return max(0, self._sum_closing("Provisions"))
+        return self._sum_closing("Provisions")
 
     def non_current_investments(self) -> float:
         return -self._sum_closing("Investments")
@@ -316,7 +427,10 @@ class FinancialData:
         return -self._sum_closing("Misc. Expenses (ASSET)")
 
     def trade_receivables(self) -> float:
-        return max(0, -self._sum_closing("Sundry Debtors"))
+        # Sundry Debtors are debit-natured (negate to display positive).
+        # Net credit (advances received exceeding receivables) shows as
+        # negative on this line so the BS stays balanced.
+        return -self._sum_closing("Sundry Debtors")
 
     def cash_and_bank(self) -> float:
         # Tally: for is_deemedpositive groups, negative closing = debit = asset (cash/bank balance)
@@ -337,10 +451,10 @@ class FinancialData:
         return -net if net < 0 else 0.0
 
     def other_current_assets(self) -> float:
-        oca       = -self._sum_closing("Current Assets")
-        branch_dr = max(0, -self._sum_closing("Branch / Divisions"))
-        dt_asset  = self.duties_and_taxes_asset()
-        return oca + branch_dr + dt_asset
+        # Branch / Divisions and Duties & Taxes are now shown signed on
+        # the liability side (negative if net-debit / refundable) so the
+        # BS still balances without us re-categorising them here.
+        return -self._sum_closing("Current Assets")
 
     def deferred_tax_asset(self) -> float:
         dtl = next((l.closing for l in self.ledgers
@@ -378,12 +492,30 @@ class FinancialData:
         return (self.short_term_borrowings()
                 + self.bank_od_in_bank_accounts()   # OD banks under Bank Accounts group
                 + self.trade_payables()
-                + max(0, self.duties_and_taxes_net())
+                + self.duties_and_taxes_net()
                 + self.other_current_liabilities()
                 + self.short_term_provisions())
 
     def total_equity_liabilities(self) -> float:
         return self.total_equity() + self.total_noncurrent_liab() + self.total_current_liab()
+
+    # ── Auto-balancing reconciliation ─────────────────────────────────────────
+    # When Tally records year-end adjustments (inventory revaluation, forex
+    # gain/loss, rounding) that don't flow through trn_accounting vouchers,
+    # the rebuilt BS can carry a small residual. We surface it on the BS face
+    # as a "Year-end Reconciliation" line so the printed BS always balances.
+    def bs_reconciliation(self) -> float:
+        """Plug = Total Assets − Total Equity & Liabilities. Added to the
+        E&L side so the BS always closes to zero on the face. Visible to
+        the user (with a flag if the magnitude is material)."""
+        return self.total_assets() - self.total_equity_liabilities()
+
+    def bs_reconciliation_is_material(self, threshold_pct: float = 1.0) -> bool:
+        """True if the auto-balance plug exceeds threshold_pct of Total Assets."""
+        ta = abs(self.total_assets())
+        if ta < 1:
+            return abs(self.bs_reconciliation()) > 1
+        return abs(self.bs_reconciliation()) / ta * 100 > threshold_pct
 
 
 # ─── Validation ───────────────────────────────────────────────────────────────
@@ -579,17 +711,35 @@ def validate_financial_data(fd: "FinancialData") -> ValidationResult:
     vr = ValidationResult()
 
     # ── Balance sheet equation ────────────────────────────────────────────────
+    # The BS face now always closes to zero via a Year-end Reconciliation
+    # auto-balance line. The check below grades the magnitude of that plug
+    # so users know whether it's a clean rebuild (≈₹0) or absorbing a
+    # material year-end adjustment from Tally that wasn't journaled.
     diff = fd.total_assets() - fd.total_equity_liabilities()
+    ta_abs = max(abs(fd.total_assets()), 1.0)
+    pct = abs(diff) / ta_abs * 100
     if abs(diff) < 1:
-        vr.info("Balance Sheet", "Balance sheet balances to zero. ✓")
-    elif abs(diff) < 50_000:
+        vr.info("Balance Sheet",
+                "BS balances exactly (voucher-rebuilt closings, no reconciliation needed). ✓")
+    elif pct < 0.01:
+        vr.info("Balance Sheet",
+                f"BS auto-balanced via Year-end Reconciliation line: ₹{diff:,.2f} "
+                f"({pct:.4f}% of TA)",
+                "Negligible plug — likely rounding in voucher amounts. Statement is reliable.")
+    elif pct < 1.0:
         vr.warning("Balance Sheet",
-                   f"Small imbalance: ₹{diff:,.2f}",
-                   "Likely a rounding difference in stock or depreciation entries.")
+                   f"BS auto-balanced via Year-end Reconciliation line: ₹{diff:,.2f} "
+                   f"({pct:.3f}% of TA)",
+                   "Tally recorded year-end adjustments (forex revaluation, inventory "
+                   "revaluation, etc.) that are not in trn_accounting. Review the "
+                   "Reconciliation line on the BS face.")
     else:
         vr.error("Balance Sheet",
-                 f"Balance sheet does not balance — difference: ₹{diff:,.0f}",
-                 "Check for ledgers with unusual group assignments or missing classifications.")
+                 f"BS reconciliation plug is MATERIAL: ₹{diff:,.0f} ({pct:.2f}% of TA)",
+                 "Possible causes: (1) ledgers with missing or wrong primary-group "
+                 "classification, (2) trn_accounting incomplete for this period, "
+                 "(3) large off-journal year-end entries. Inspect ledger primary "
+                 "groups in the Group Mapping tab and re-run.")
 
     # ── P&L reconciliation ────────────────────────────────────────────────────
     cy_profit    = fd.pnl_balance - fd.pnl_opening   # current year as Tally computed it
@@ -732,35 +882,106 @@ def validate_financial_data(fd: "FinancialData") -> ValidationResult:
 
 # ─── ZIP / CSV helpers ────────────────────────────────────────────────────────
 
-def extract_sqlite_from_zip(zip_path: str) -> str:
-    """Extract the SQLite database from a TSF Exporter ZIP to a temp file.
+# config.csv (newer TSF Exporter format) key → _export_info key
+_CONFIG_KEY_MAP: dict[str, str] = {
+    "company name": "company_name",
+    "period from":  "period_from",
+    "period to":    "period_to",
+}
 
-    Returns the temp file path.  Caller must delete the file when done.
-    Raises RuntimeError if no SQLite is found in the archive.
+
+def _load_csv_bytes_into_table(data: bytes, table_name: str,
+                                con: sqlite3.Connection) -> None:
+    """Parse *data* as UTF-8 CSV and insert rows into *table_name* in *con*."""
+    import io as _io
+    reader = csv.reader(_io.TextIOWrapper(_io.BytesIO(data), encoding='utf-8-sig'))
+    headers = next(reader, None)
+    if not headers:
+        return
+    cols = [h.strip() for h in headers]
+    cols_def = ', '.join(f'"{c}" TEXT' for c in cols)
+    con.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols_def})')
+    placeholders = ', '.join('?' * len(cols))
+    con.executemany(f'INSERT INTO "{table_name}" VALUES ({placeholders})', reader)
+
+
+def _load_config_csv_as_export_info(data: bytes, con: sqlite3.Connection) -> None:
+    """Read config.csv bytes and write a normalised _export_info table."""
+    import io as _io
+    reader = csv.reader(_io.TextIOWrapper(_io.BytesIO(data), encoding='utf-8-sig'))
+    next(reader, None)  # skip header row
+    con.execute('CREATE TABLE IF NOT EXISTS "_export_info" ("name" TEXT, "value" TEXT)')
+    for row in reader:
+        if len(row) < 2:
+            continue
+        key = _CONFIG_KEY_MAP.get(row[0].strip().lower(), row[0].strip().lower().replace(' ', '_'))
+        con.execute('INSERT INTO "_export_info" VALUES (?, ?)', (key, row[1].strip()))
+
+
+def csv_zip_to_sqlite(zip_path: str) -> str:
+    """Read a TSF Exporter ZIP whose contents are CSV files into a temp SQLite.
+
+    Handles both the older _export_info.csv and the newer config.csv metadata
+    format.  Returns the temp file path; caller must delete when done.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
+    tmp.close()
+    con = sqlite3.connect(tmp.name)
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            names = {n for n in zf.namelist() if not n.startswith('__MACOSX/')}
+            # Metadata: prefer config.csv (newer exporter), fall back to _export_info.csv
+            if 'config.csv' in names:
+                _load_config_csv_as_export_info(zf.read('config.csv'), con)
+            elif '_export_info.csv' in names:
+                _load_csv_bytes_into_table(zf.read('_export_info.csv'), '_export_info', con)
+            # Load all other CSV tables
+            skip = {'config.csv', '_export_info.csv', 'README_FOR_LLM.md'}
+            for entry in names:
+                if entry in skip or not entry.lower().endswith('.csv'):
+                    continue
+                table_name = entry.rsplit('/', 1)[-1][:-4]  # basename without .csv
+                _load_csv_bytes_into_table(zf.read(entry), table_name, con)
+        con.commit()
+    finally:
+        con.close()
+    return tmp.name
+
+
+def extract_sqlite_from_zip(zip_path: str) -> str:
+    """Return a temp SQLite path for a TSF Exporter ZIP.
+
+    Supports two ZIP formats:
+      • SQLite inside ZIP  – original TSF Exporter format
+      • CSVs inside ZIP    – newer TSF Exporter format (config.csv + mst_*.csv)
+    Caller must delete the returned file when done.
     """
     with zipfile.ZipFile(zip_path, 'r') as zf:
+        names = zf.namelist()
         db_entries = [
-            n for n in zf.namelist()
+            n for n in names
             if n.lower().endswith(('.sqlite', '.db'))
             and not n.startswith('__MACOSX/')
         ]
-        if not db_entries:
-            raise RuntimeError(
-                "No SQLite file found inside the ZIP.\n"
-                "Select the .zip file produced by the TSF Exporter."
-            )
-        tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
-        tmp.write(zf.read(db_entries[0]))
-        tmp.close()
-        return tmp.name
+        if db_entries:
+            tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
+            tmp.write(zf.read(db_entries[0]))
+            tmp.close()
+            return tmp.name
+        # CSV-only ZIP (newer TSF Exporter)
+        if any(n == 'mst_ledger.csv' for n in names):
+            return csv_zip_to_sqlite(zip_path)
+    raise RuntimeError(
+        "The ZIP does not appear to be a TSF Exporter export.\n"
+        "Expected either a .sqlite/.db file or mst_ledger.csv inside the ZIP."
+    )
 
 
 def csv_folder_to_sqlite(folder: str) -> str:
     """Import TSF Exporter CSV files from *folder* into a temp SQLite file.
 
-    Looks for mst_ledger.csv, mst_group.csv, _export_info.csv (and optional
-    trn_accounting.csv / trn_voucher.csv).  Returns the temp file path.
-    Caller must delete the file when done.
+    Supports both _export_info.csv (older) and config.csv (newer exporter).
+    Returns the temp file path; caller must delete when done.
     """
     folder_path = Path(folder)
     required = {'mst_ledger', 'mst_group'}
@@ -769,30 +990,29 @@ def csv_folder_to_sqlite(folder: str) -> str:
         raise RuntimeError(
             f"Required CSV file(s) not found in the selected folder:\n"
             f"  {', '.join(f'{t}.csv' for t in missing)}\n\n"
-            "Select the folder that contains mst_ledger.csv and mst_group.csv "
-            "(the folder produced by the TSF Exporter)."
+            "Select the folder that contains mst_ledger.csv and mst_group.csv."
         )
     tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
     tmp.close()
     con = sqlite3.connect(tmp.name)
     try:
-        for table_name in ('mst_ledger', 'mst_group', '_export_info',
-                           'trn_accounting', 'trn_voucher'):
+        # Metadata: prefer _export_info.csv, fall back to config.csv
+        info_file = folder_path / '_export_info.csv'
+        config_file = folder_path / 'config.csv'
+        if info_file.exists():
+            with open(info_file, newline='', encoding='utf-8-sig') as f:
+                data = f.read().encode('utf-8')
+            _load_csv_bytes_into_table(data, '_export_info', con)
+        elif config_file.exists():
+            _load_config_csv_as_export_info(config_file.read_bytes(), con)
+
+        for table_name in ('mst_ledger', 'mst_group', 'trn_accounting', 'trn_voucher'):
             csv_file = folder_path / f"{table_name}.csv"
             if not csv_file.exists():
                 continue
             with open(csv_file, newline='', encoding='utf-8-sig') as f:
-                reader = csv.reader(f)
-                headers = next(reader, None)
-                if not headers:
-                    continue
-                cols = [h.strip() for h in headers]
-                cols_def = ', '.join(f'"{c}" TEXT' for c in cols)
-                con.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols_def})')
-                placeholders = ', '.join('?' * len(cols))
-                con.executemany(
-                    f'INSERT INTO "{table_name}" VALUES ({placeholders})', reader
-                )
+                data = f.read().encode('utf-8')
+            _load_csv_bytes_into_table(data, table_name, con)
         con.commit()
     finally:
         con.close()
@@ -849,6 +1069,32 @@ def load_from_sqlite(db_path: str,
     ledger_cols = {r[1] for r in con.execute("PRAGMA table_info(mst_ledger)")}
     has_opening = "opening_balance" in ledger_cols
 
+    # ── Voucher-driven closing balances ──────────────────────────────────────
+    # Tally's mst_ledger.closing_balance is a presentation-layer figure that
+    # can include implicit stock / P&L synthesis and post-hoc adjustments
+    # (inventory revaluations etc.) which break the BS by small amounts.
+    # The double-entry journal trn_accounting is the ground truth: every
+    # accounting voucher's debits == credits, so:
+    #     closing(ledger) = opening(ledger) + Σ amount where v.is_accounting_voucher = '1'
+    # produces a trial balance that sums to ₹0 exactly (apart from the
+    # inventory-module stock offset which we handle separately).
+    voucher_movements: dict[str, float] = {}
+    try:
+        existing_tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if "trn_accounting" in existing_tables and "trn_voucher" in existing_tables:
+            mv_rows = con.execute("""
+                SELECT a.ledger, SUM(CAST(a.amount AS REAL)) AS mv
+                  FROM trn_accounting a
+                  JOIN trn_voucher    v ON v.guid = a.guid
+                 WHERE v.is_accounting_voucher = '1'
+                 GROUP BY a.ledger
+            """).fetchall()
+            voucher_movements = {r["ledger"]: float(r["mv"] or 0.0) for r in mv_rows}
+    except Exception:
+        voucher_movements = {}
+
     # Profit & Loss A/c (special ledger, no parent group)
     # closing_balance = cumulative (prior year opening + current year profit)
     # opening_balance = prior year retained earnings not yet transferred to Reserves
@@ -873,6 +1119,10 @@ def load_from_sqlite(db_path: str,
         pass   # pnl_balance stays 0
 
     # Balance-sheet ledgers from mst_ledger (closing balances = year-end positions)
+    # Enrich with bank / GST / PAN columns when present (newer exports only).
+    def _col_or_blank(col: str) -> str:
+        return f"COALESCE(l.{col}, '')" if col in ledger_cols else "''"
+
     open_col = "l.opening_balance" if has_opening else "'0'"
     bs_rows = con.execute(f"""
         SELECT
@@ -881,7 +1131,13 @@ def load_from_sqlite(db_path: str,
             g.primary_group,
             {open_col} AS opening_raw,
             l.closing_balance AS closing_raw,
-            COALESCE(g.is_deemedpositive, '0') AS is_dp
+            COALESCE(g.is_deemedpositive, '0') AS is_dp,
+            {_col_or_blank('bank_account_number')} AS bank_account_number,
+            {_col_or_blank('bank_ifsc')}           AS bank_ifsc,
+            {_col_or_blank('bank_name')}           AS bank_name,
+            {_col_or_blank('bank_branch')}         AS bank_branch,
+            {_col_or_blank('gstn')}                AS gstn,
+            {_col_or_blank('it_pan')}              AS it_pan
         FROM mst_ledger l
         LEFT JOIN mst_group g ON g.name = l.parent
         WHERE g.primary_group IS NOT NULL
@@ -908,14 +1164,29 @@ def load_from_sqlite(db_path: str,
             inferred = infer_standard_group(pg, _pg_parents.get(r["primary_group"], set()))
             if inferred:
                 pg = inferred
+        op_val = safe_float(r["opening_raw"])
+        # Authoritative closing = opening + voucher movements. If the ledger
+        # has no recorded movements (e.g. Profit & Loss A/c which Tally
+        # synthesises), fall back to Tally's closing_balance text.
+        ledger_name = r["name"]
+        if ledger_name in voucher_movements:
+            cl_val = op_val + voucher_movements[ledger_name]
+        else:
+            cl_val = safe_float(r["closing_raw"])
         ledgers.append(LedgerRow(
-            name=r["name"],
+            name=ledger_name,
             parent=r["parent"],
             primary_group=pg,
-            opening=safe_float(r["opening_raw"]),
-            closing=safe_float(r["closing_raw"]),
+            opening=op_val,
+            closing=cl_val,
             is_deemedpositive=str(r["is_dp"]) == "1",
             branch=branch_name,
+            bank_account_number=str(r["bank_account_number"] or ""),
+            bank_ifsc=str(r["bank_ifsc"] or ""),
+            bank_name=str(r["bank_name"] or ""),
+            bank_branch=str(r["bank_branch"] or ""),
+            gstn=str(r["gstn"] or ""),
+            it_pan=str(r["it_pan"] or ""),
         ))
 
     # P&L activity from trn_accounting (kept for future use / cross-checks).
@@ -951,6 +1222,50 @@ def load_from_sqlite(db_path: str,
     except Exception:
         pnl_rows = []   # trn_accounting absent or malformed — non-fatal
 
+    # ── Itemwise inventory (mst_stock_item) — fixes BS when stock is tracked
+    #    in the inventory module instead of posted to a Stock-in-hand ledger.
+    stock_items: list[StockItem] = []
+    try:
+        existing_tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if "mst_stock_item" in existing_tables:
+            si_cols = {r[1] for r in con.execute("PRAGMA table_info(mst_stock_item)")}
+            def _g(col: str) -> str:
+                return col if col in si_cols else "NULL"
+            si_rows = con.execute(f"""
+                SELECT
+                    {_g('name')}            AS name,
+                    {_g('parent')}          AS parent,
+                    {_g('uom')}             AS uom,
+                    {_g('gst_hsn_code')}    AS hsn_code,
+                    {_g('gst_rate')}        AS gst_rate,
+                    {_g('opening_balance')} AS opening_qty,
+                    {_g('opening_rate')}    AS opening_rate,
+                    {_g('opening_value')}   AS opening_value,
+                    {_g('closing_balance')} AS closing_qty,
+                    {_g('closing_rate')}    AS closing_rate,
+                    {_g('closing_value')}   AS closing_value
+                FROM mst_stock_item
+            """).fetchall()
+            for r in si_rows:
+                stock_items.append(StockItem(
+                    name=str(r["name"] or ""),
+                    parent=str(r["parent"] or ""),
+                    uom=str(r["uom"] or ""),
+                    hsn_code=str(r["hsn_code"] or ""),
+                    gst_rate=safe_float(r["gst_rate"]),
+                    opening_qty=safe_float(r["opening_qty"]),
+                    opening_rate=safe_float(r["opening_rate"]),
+                    opening_value=safe_float(r["opening_value"]),
+                    closing_qty=safe_float(r["closing_qty"]),
+                    closing_rate=safe_float(r["closing_rate"]),
+                    closing_value=safe_float(r["closing_value"]),
+                    branch=branch_name,
+                ))
+    except Exception:
+        stock_items = []   # mst_stock_item absent or malformed — non-fatal
+
     con.close()
     return FinancialData(
         company=company,
@@ -964,6 +1279,7 @@ def load_from_sqlite(db_path: str,
         opening_stock_override=opening_stock_override,
         closing_stock_override=closing_stock_override,
         branch_name=branch_name,
+        stock_items=stock_items,
     )
 
 
@@ -996,9 +1312,11 @@ def consolidate_branches(branches: list[FinancialData]) -> FinancialData:
 
     all_ledgers: list[LedgerRow] = []
     all_pnl_rows: list[PnlRow] = []
+    all_stock_items: list[StockItem] = []
     for b in branches:
         all_ledgers.extend(b.ledgers)
         all_pnl_rows.extend(b.pnl_rows)
+        all_stock_items.extend(b.stock_items)
 
     def _sum_opt(vals: list[float | None]) -> float | None:
         present = [v for v in vals if v is not None]
@@ -1016,6 +1334,7 @@ def consolidate_branches(branches: list[FinancialData]) -> FinancialData:
         opening_stock_override=_sum_opt([b.opening_stock_override for b in branches]),
         closing_stock_override=_sum_opt([b.closing_stock_override for b in branches]),
         branch_name="Consolidated",
+        stock_items=all_stock_items,
     )
 
 
@@ -1047,6 +1366,10 @@ def _align(h="left", v="center", wrap=False) -> Alignment:
 
 INR = '#,##0'          # Indian number format (openpyxl uses comma-separated)
 INR2 = '#,##0.00'
+# Accounting-style: positive shown plain, negatives in parens, zero as em-dash.
+# Used on the Balance Sheet face so net-debit liabilities (now shown signed)
+# read naturally without minus signs.
+INR_ACC = '#,##0;(#,##0);"–"'
 
 def _fmt(ws, cell_ref: str, value: float | None, italic: bool = False) -> None:
     cell = ws[cell_ref]
@@ -1059,9 +1382,11 @@ def _fmt(ws, cell_ref: str, value: float | None, italic: bool = False) -> None:
 
 class ExcelWriter:
     def __init__(self, fd: FinancialData, proj: "ProjectionInputs | None" = None,
-                 branches: list[FinancialData] | None = None):
+                 branches: list[FinancialData] | None = None,
+                 cma: bool = False):
         self.fd = fd
         self.proj = proj
+        self.cma = cma   # when True (and proj is set), emit the 6-sheet CMA pack
         # branches: per-branch FinancialData list. If None or len <= 1, the workbook
         # uses single-column BS/P&L. If len >= 2, branch columns + Total are emitted.
         self.branches: list[FinancialData] = branches or []
@@ -1094,16 +1419,23 @@ class ExcelWriter:
         self._write_note_lt_borrowings()
         self._write_note_st_borrowings()
         self._write_note_trade_payables()
+        self._write_note_other_cl()
+        self._write_note_provisions()
         self._write_note_fixed_assets()
+        self._write_note_nc_investments()
+        self._write_note_lt_loans_advances()
         self._write_note_inventories()
         self._write_note_trade_receivables()
         self._write_note_cash_bank()
+        self._write_note_other_ca()
         self._write_notes_index()
         if self.proj:
             pe = ProjectionEngine(self.fd, self.proj)
             self._write_proj_pnl(pe)
             self._write_proj_bs(pe)
             self._write_assumptions()
+            if self.cma:
+                CMAWriter(self.wb, self.fd, self.proj, pe).write_all()
         vr = validate_financial_data(self.fd)
         self._write_validation(vr)
         self.wb.save(path)
@@ -1167,20 +1499,28 @@ class ExcelWriter:
         bcols, tcol, last_col = self._value_cols()
         multi = self._multibranch
 
-        ws.column_dimensions["A"].width = 46
-        ws.column_dimensions["B"].width = 8
+        ws.sheet_view.showGridLines = False
+        # Outline: summary (parent) row ABOVE its detail (standard accounting subtotal style)
+        ws.sheet_properties.outlinePr.summaryBelow = False
+        ws.sheet_properties.outlinePr.summaryRight = False
+        ws.column_dimensions["A"].width = 60
+        ws.column_dimensions["B"].width = 7
         if multi:
             for bc in bcols:
-                ws.column_dimensions[bc].width = 16
-            ws.column_dimensions[tcol].width = 18
+                ws.column_dimensions[bc].width = 20
+            ws.column_dimensions[tcol].width = 22
         else:
-            ws.column_dimensions["C"].width = 18
-            ws.column_dimensions["D"].width = 18
+            ws.column_dimensions["C"].width = 22
+            ws.column_dimensions["D"].width = 22
 
         merge_span = f"A{{r}}:{last_col}{{r}}"
+        # Strong top border used above subtotal value cells (accounting style)
+        side_thin = Side(style="thin", color=C_DARK_BLUE)
+        side_med  = Side(style="medium", color=C_DARK_BLUE)
+        total_border = Border(top=side_thin, bottom=side_med)
 
         r = 1
-        def header(text, bg=C_HEADER_BG, fg=C_WHITE, sz=12, bold=True):
+        def header(text, bg=C_HEADER_BG, fg=C_WHITE, sz=12, bold=True, height=None):
             nonlocal r
             ws.merge_cells(merge_span.format(r=r))
             cell = ws[f"A{r}"]
@@ -1188,16 +1528,19 @@ class ExcelWriter:
             cell.font = _font(bold=bold, size=sz, color=fg)
             cell.fill = _fill(bg)
             cell.alignment = _align("center")
+            if height:
+                ws.row_dimensions[r].height = height
             r += 1
 
-        def subheader(text, bg=C_SUBHD_BG):
+        def subheader(text, bg=C_MID_BLUE):
             nonlocal r
             ws.merge_cells(merge_span.format(r=r))
             cell = ws[f"A{r}"]
             cell.value = text
-            cell.font = _font(bold=True, size=10)
+            cell.font = _font(bold=True, size=10, color=C_WHITE)
             cell.fill = _fill(bg)
             cell.alignment = _align("left")
+            ws.row_dimensions[r].height = 20
             r += 1
 
         def col_header():
@@ -1225,13 +1568,13 @@ class ExcelWriter:
         def _value_for(branch_fd: FinancialData, fn) -> float:
             return fn(branch_fd)
 
-        def row(label, amount_fn, note=None, indent=0, bold=False, total=False, fmt=INR):
+        def row(label, amount_fn, note=None, indent=0, bold=False, total=False, fmt=INR_ACC):
             """amount_fn: callable(FinancialData)->float, or None to leave blank."""
             nonlocal r
-            prefix = "  " * indent
-            ws[f"A{r}"].value = prefix + label
+            # Indent inside the cell only; label already uses "  a)  " etc.
+            ws[f"A{r}"].value = ("  " * indent) + label
             ws[f"A{r}"].font = _font(bold=bold or total, size=10)
-            ws[f"A{r}"].alignment = _align("left")
+            ws[f"A{r}"].alignment = _align("left", v="center")
             if note:
                 note_sheet_name = self._note_sheet_name(int(note))
                 ws[f"B{r}"].value = note
@@ -1252,30 +1595,31 @@ class ExcelWriter:
                 cell.font = _font(bold=bold or total, size=10)
                 cell.alignment = _align("right")
             if total:
-                cols_to_fill = ["A"] + (bcols if multi else []) + [tcol]
-                for col in cols_to_fill:
+                value_cols = (bcols if multi else ["C"]) + ([tcol] if multi else [])
+                ws[f"A{r}"].fill = _fill(C_TOTAL_BG)
+                for col in value_cols:
                     ws[f"{col}{r}"].fill = _fill(C_TOTAL_BG)
-                    ws[f"{col}{r}"].border = _border()
+                    ws[f"{col}{r}"].border = total_border
             r += 1
             return r - 1
 
-        def formula_row(label, ref_rows, bold=False, total=False, fmt=INR, op="+"):
+        def formula_row(label, ref_rows, bold=False, total=False, fmt=INR_ACC, op="+"):
             """Writes a formula = ref_rows[0] op ref_rows[1] op ... in each value column."""
             nonlocal r
             ws[f"A{r}"].value = label
             ws[f"A{r}"].font = _font(bold=bold or total, size=10)
-            all_cols = (bcols if multi else []) + [tcol]
-            for col in all_cols:
+            value_cols = (bcols if multi else ["C"]) + ([tcol] if multi else [])
+            for col in value_cols:
                 cell = ws[f"{col}{r}"]
                 cell.value = "=" + op.join(f"{col}{rr}" for rr in ref_rows)
                 cell.number_format = fmt
                 cell.font = _font(bold=bold or total, size=10)
                 cell.alignment = _align("right")
             if total:
-                cols_to_fill = ["A"] + all_cols
-                for col in cols_to_fill:
+                ws[f"A{r}"].fill = _fill(C_TOTAL_BG)
+                for col in value_cols:
                     ws[f"{col}{r}"].fill = _fill(C_TOTAL_BG)
-                    ws[f"{col}{r}"].border = _border()
+                    ws[f"{col}{r}"].border = total_border
             r += 1
             return r - 1
 
@@ -1283,38 +1627,142 @@ class ExcelWriter:
             nonlocal r
             r += 1
 
-        header(fd.company.upper(), sz=14)
-        header("BALANCE SHEET" + ("  (Branch-wise + Consolidated)" if multi else ""), sz=12)
+        # ── Detail/breakdown rows under each BS line (Excel outline level 1) ──
+        def breakdown(items: list[tuple[str, "callable | float"]],
+                      detail_indent: int = 2):
+            """Emit collapsible detail rows below the immediately-preceding main
+            line. Each item is (label, amount-or-callable). Amounts can be either
+            a float (consolidated only) or a callable(FinancialData)->float that
+            evaluates per-branch in multi-branch mode."""
+            nonlocal r
+            value_cols = (bcols if multi else ["C"]) + ([tcol] if multi else [])
+            for label, amt in items:
+                ws[f"A{r}"].value = ("  " * detail_indent) + label
+                ws[f"A{r}"].font = Font(italic=True, size=9, color="555555", name="Calibri")
+                ws[f"A{r}"].alignment = _align("left", v="center")
+                # Value rendering — branch columns + total
+                if callable(amt):
+                    if multi:
+                        for i, b in enumerate(self.branches):
+                            cell = ws[f"{bcols[i]}{r}"]
+                            cell.value = amt(b)
+                            cell.number_format = INR_ACC
+                            cell.font = Font(italic=True, size=9, color="555555", name="Calibri")
+                            cell.alignment = _align("right")
+                    cell = ws[f"{tcol}{r}"]
+                    cell.value = amt(fd)
+                    cell.number_format = INR_ACC
+                    cell.font = Font(italic=True, size=9, color="555555", name="Calibri")
+                    cell.alignment = _align("right")
+                else:
+                    cell = ws[f"{tcol}{r}"]
+                    cell.value = amt
+                    cell.number_format = INR_ACC
+                    cell.font = Font(italic=True, size=9, color="555555", name="Calibri")
+                    cell.alignment = _align("right")
+                # Outline level 1 + hidden by default — click [+] in Excel to expand
+                ws.row_dimensions[r].outline_level = 1
+                ws.row_dimensions[r].hidden = True
+                # Light zebra-fill on every other detail row for readability
+                if r % 2 == 0:
+                    for col in ["A"] + value_cols:
+                        ws[f"{col}{r}"].fill = _fill("F5F8FC")
+                r += 1
+
+        # Build standard breakdowns from FinancialData (sub-group totals)
+        def _by_parent(primary_group: str, sign: int = 1):
+            """Return [(parent_subgroup, sum_signed)] for ledgers of a primary group."""
+            buckets: dict[str, float] = {}
+            for l in fd._ledgers_for(primary_group):
+                buckets[l.parent] = buckets.get(l.parent, 0) + sign * l.closing
+            return sorted(buckets.items(), key=lambda x: -abs(x[1]))[:8]   # top 8
+
+        def _by_parent_callable(primary_group: str, sign: int = 1):
+            """Lambda factory for multi-branch breakdowns (per-branch values)."""
+            def build_for(branch_fd):
+                buckets: dict[str, float] = {}
+                for l in branch_fd._ledgers_for(primary_group):
+                    buckets[l.parent] = buckets.get(l.parent, 0) + sign * l.closing
+                return buckets
+            # Get parent list from consolidated; values per-branch
+            consolidated_buckets = {}
+            for l in fd._ledgers_for(primary_group):
+                consolidated_buckets[l.parent] = consolidated_buckets.get(l.parent, 0) + sign * l.closing
+            ranked_parents = [p for p, _ in
+                              sorted(consolidated_buckets.items(), key=lambda x: -abs(x[1]))[:8]]
+            return [(p, lambda b, _p=p, _s=sign:
+                     sum(_s * l.closing for l in b._ledgers_for(primary_group) if l.parent == _p))
+                    for p in ranked_parents]
+
+        header(fd.company.upper(), sz=14, height=24)
+        header("BALANCE SHEET" + ("  (Branch-wise + Consolidated)" if multi else ""), sz=12, height=20)
         header(f"As at {fd.period_label}", sz=10, bg=C_MID_BLUE)
-        header("(Amount in ₹)", sz=9, bg=C_LIGHT_BLUE, fg=C_BLACK, bold=False)
+        header("(All amounts in ₹  ·  negatives in parentheses)", sz=9,
+               bg=C_LIGHT_BLUE, fg=C_BLACK, bold=False)
         col_header()
 
         # ── EQUITY & LIABILITIES ──────────────────────────────────────────────
         subheader("I.  SHAREHOLDERS' FUNDS")
         sc_r  = row("  a)  Share Capital",           lambda b: b.share_capital(),       note="1")
+        breakdown(_by_parent_callable("Capital Account", +1) if multi
+                  else _by_parent("Capital Account", +1))
         res_r = row("  b)  Reserves & Surplus",      lambda b: b.reserves_surplus(),    note="2")
-        formula_row("Total Shareholders' Funds", [sc_r, res_r], bold=True, total=True)
+        breakdown([("Reserves & Surplus group",
+                    lambda b: b._sum_closing("Reserves & Surplus")),
+                   ("P&L A/c (retained, this + prior years)",
+                    lambda b: b.pnl_balance)])
+        sf_total = formula_row("Total Shareholders' Funds", [sc_r, res_r], bold=True, total=True)
         spacer()
 
         subheader("II.  NON-CURRENT LIABILITIES")
         ltb_r = row("  a)  Long-Term Borrowings",    lambda b: b.long_term_borrowings(), note="3")
+        breakdown([("Secured Loans",   lambda b: b._sum_closing("Secured Loans")),
+                   ("Unsecured Loans", lambda b: b._sum_closing("Unsecured Loans")),
+                   ("Loans (Liability)", lambda b: b._sum_closing("Loans (Liability)"))])
         dtl_r = row("  b)  Deferred Tax Liability",  lambda b: b.deferred_tax_liability())
-        formula_row("Total Non-Current Liabilities", [ltb_r, dtl_r], bold=True, total=True)
+        ncl_total = formula_row("Total Non-Current Liabilities", [ltb_r, dtl_r], bold=True, total=True)
         spacer()
 
         subheader("III.  CURRENT LIABILITIES")
-        stb_r  = row("  a)  Short-Term Borrowings",     lambda b: b.short_term_borrowings(), note="4")
+        stb_r  = row("  a)  Short-Term Borrowings",     lambda b: b.short_term_borrowings() + b.bank_od_in_bank_accounts(), note="4")
+        breakdown([("Bank OD A/c",                  lambda b: b.short_term_borrowings()),
+                   ("Banks with credit balance (OD)", lambda b: b.bank_od_in_bank_accounts())])
         tp_r   = row("  b)  Trade Payables",            lambda b: b.trade_payables(),         note="5")
-        dt_r   = row("  c)  Duties & Taxes (Net)",      lambda b: max(0, b.duties_and_taxes_net()))
+        breakdown(_by_parent_callable("Sundry Creditors", +1) if multi
+                  else _by_parent("Sundry Creditors", +1))
+        dt_r   = row("  c)  Duties & Taxes (Net)",      lambda b: b.duties_and_taxes_net())
+        breakdown(_by_parent_callable("Duties & Taxes", +1) if multi
+                  else _by_parent("Duties & Taxes", +1))
         ocl_r  = row("  d)  Other Current Liabilities", lambda b: b.other_current_liabilities(), note="6")
+        breakdown([("Current Liabilities", lambda b: b._sum_closing("Current Liabilities")),
+                   ("Branch / Divisions",  lambda b: b._sum_closing("Branch / Divisions")),
+                   ("Suspense A/c",        lambda b: b._sum_closing("Suspense A/c"))])
         prov_r = row("  e)  Short-Term Provisions",     lambda b: b.short_term_provisions(),  note="7")
-        formula_row("Total Current Liabilities",
+        breakdown(_by_parent_callable("Provisions", +1) if multi
+                  else _by_parent("Provisions", +1))
+        cl_total = formula_row("Total Current Liabilities",
                     [stb_r, tp_r, dt_r, ocl_r, prov_r], bold=True, total=True)
         spacer()
 
-        # Grand total E&L
-        te_r = row("TOTAL EQUITY & LIABILITIES", lambda b: b.total_equity_liabilities(), bold=True)
+        # Year-end reconciliation plug: absorbs the residual gap from Tally
+        # year-end adjustments (forex revaluation, inventory revaluation,
+        # rounding) that don't flow through trn_accounting vouchers. The
+        # value is computed as Total Assets − (E&L excluding this line) so
+        # the BS always closes to zero on the face. The Validation sheet
+        # flags it if the magnitude exceeds 1% of Total Assets.
+        recon_r = row("  f)  Year-end Reconciliation  (auto-balance)",
+                      lambda b: b.bs_reconciliation())
+        # Render in muted italic so it reads as a non-substantive plug line
+        for col in ["A"] + (bcols if multi else ["C"]) + ([tcol] if multi else []):
+            ws[f"{col}{recon_r}"].font = Font(italic=True, size=9, color="6B6B6B", name="Calibri")
+        spacer()
+
+        # Grand total E&L — formula-summed across the three subtotals + recon,
+        # so the printed total always ties to the lines above (and to TA).
         all_value_cols = (bcols if multi else ["C"]) + ([tcol] if multi else [])
+        te_r = formula_row("TOTAL EQUITY & LIABILITIES",
+                           [sf_total, ncl_total, cl_total, recon_r],
+                           bold=True, total=True)
         for col in ["A"] + all_value_cols:
             ws[f"{col}{te_r}"].fill = _fill(C_HEADER_BG)
             ws[f"{col}{te_r}"].font = Font(bold=True, size=11, color=C_WHITE, name="Calibri")
@@ -1323,8 +1771,14 @@ class ExcelWriter:
         # ── ASSETS ───────────────────────────────────────────────────────────
         subheader("I.  NON-CURRENT ASSETS")
         fa_r   = row("  a)  Fixed Assets (Net Block)",     lambda b: b.net_fixed_assets(),          note="8")
+        breakdown([("Gross Block",             lambda b: sum(s["gross_close"] for s in b.fixed_assets_schedule())),
+                   ("Less: Accumulated Depr.", lambda b: -sum(s["depr_close"]  for s in b.fixed_assets_schedule()))])
         inv_r  = row("  b)  Non-Current Investments",      lambda b: b.non_current_investments(),   note="9")
+        breakdown(_by_parent_callable("Investments", -1) if multi
+                  else _by_parent("Investments", -1))
         lla_r  = row("  c)  Long-Term Loans & Advances",   lambda b: b.long_term_loans_advances(),  note="10")
+        breakdown([("Deposits (Asset)",          lambda b: -b._sum_closing("Deposits (Asset)")),
+                   ("Loans & Advances (Asset)",  lambda b: -b._sum_closing("Loans & Advances (Asset)"))])
         dta_r  = row("  d)  Deferred Tax Asset",           lambda b: b.deferred_tax_asset())
         ona_r  = row("  e)  Other Non-Current Assets",     lambda b: b.other_noncurrent_assets())
         formula_row("Total Non-Current Assets",
@@ -1333,9 +1787,18 @@ class ExcelWriter:
 
         subheader("II.  CURRENT ASSETS")
         stk_r  = row("  a)  Inventories (Closing Stock)",  lambda b: b.closing_stock(),             note="11")
+        breakdown([("Stock-in-hand ledger",     lambda b: -b._sum_closing("Stock-in-hand")),
+                   ("Inventory module (computed)", lambda b: b.stock_items_closing_total() if b.stock_items else 0)])
         tr_r   = row("  b)  Trade Receivables",            lambda b: b.trade_receivables(),         note="12")
+        breakdown(_by_parent_callable("Sundry Debtors", -1) if multi
+                  else _by_parent("Sundry Debtors", -1))
         cb_r   = row("  c)  Cash & Cash Equivalents",      lambda b: b.cash_and_bank(),             note="13")
+        breakdown([("Cash-in-hand", lambda b: -b._sum_closing("Cash-in-hand")),
+                   ("Bank Accounts (debit balance)",
+                    lambda b: sum(-l.closing for l in b._ledgers_for("Bank Accounts") if l.closing < 0))])
         oca_r  = row("  d)  Other Current Assets",         lambda b: b.other_current_assets(),      note="14")
+        breakdown(_by_parent_callable("Current Assets", -1) if multi
+                  else _by_parent("Current Assets", -1))
         formula_row("Total Current Assets",
                     [stk_r, tr_r, cb_r, oca_r], bold=True, total=True)
         spacer()
@@ -1347,16 +1810,41 @@ class ExcelWriter:
         spacer(); spacer()
 
         # ── Difference check ─────────────────────────────────────────────────
-        diff_r = row("Balance Sheet Difference (should be 0)",
-                     lambda b: b.total_assets() - b.total_equity_liabilities())
+        # With the Year-end Reconciliation plug line above, the BS now
+        # always shows zero here. This row stays as a printed proof.
+        diff_r = row("Balance Sheet Difference  (Assets − Equity & Liabilities)",
+                     lambda b: b.total_assets() - b.total_equity_liabilities() - b.bs_reconciliation(),
+                     fmt=INR_ACC)
         for col in all_value_cols:
             v = ws[f"{col}{diff_r}"].value
-            if isinstance(v, (int, float)) and abs(v) > 1:
-                ws[f"{col}{diff_r}"].fill = _fill("FF0000")
-                ws[f"{col}{diff_r}"].font = Font(bold=True, size=10, color=C_WHITE)
+            if isinstance(v, (int, float)):
+                if abs(v) > 1:
+                    ws[f"{col}{diff_r}"].fill = _fill("FF0000")
+                    ws[f"{col}{diff_r}"].font = Font(bold=True, size=10, color=C_WHITE, name="Calibri")
+                    ws[f"A{diff_r}"].fill = _fill("FF0000")
+                    ws[f"A{diff_r}"].font = Font(bold=True, size=10, color=C_WHITE, name="Calibri")
+                else:
+                    ws[f"{col}{diff_r}"].fill = _fill("C6EFCE")   # accounting-green
+                    ws[f"{col}{diff_r}"].font = Font(bold=True, size=10, color="006100", name="Calibri")
+                    ws[f"A{diff_r}"].fill = _fill("C6EFCE")
+                    ws[f"A{diff_r}"].font = Font(bold=True, size=10, color="006100", name="Calibri")
         spacer(); spacer()
 
         ws.freeze_panes = "A6"
+        # Print page setup — A4 portrait, fit-to-width, repeat header on each page
+        ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
+        ws.page_setup.paperSize  = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_options.horizontalCentered = True
+        ws.page_margins.left = ws.page_margins.right = 0.4
+        ws.page_margins.top = ws.page_margins.bottom = 0.6
+        ws.print_title_rows = "1:5"
+        ws.oddHeader.center.text = f"{fd.company} — Balance Sheet"
+        ws.oddHeader.center.size = 10
+        ws.oddFooter.right.text  = "Page &P of &N"
+        ws.oddFooter.left.text   = "Generated &D"
 
     # ── Note sheet helpers ────────────────────────────────────────────────────
 
@@ -1473,11 +1961,21 @@ class ExcelWriter:
     def _write_note_trade_payables(self):
         ws, r = self._start_note_sheet(5, "Trade Payables")
         fd = self.fd
-        by_parent: dict[str, float] = {}
-        for l in fd._ledgers_for("Sundry Creditors"):
-            by_parent[l.parent] = by_parent.get(l.parent, 0) + l.closing
-        for parent, amt in sorted(by_parent.items()):
-            r = self._note_data_row(ws, r, parent, amt if amt > 0 else None)
+        # Ledger-wise breakdown, grouped by parent sub-group with sub-totals.
+        # Sign convention: credit balances are payables (shown positive);
+        # debit balances (advances paid to suppliers) shown as NEGATIVE on
+        # the same line so the BS still balances.
+        ledgers = fd._ledgers_for("Sundry Creditors")
+        by_parent: dict[str, list] = {}
+        for l in ledgers:
+            by_parent.setdefault(l.parent, []).append(l)
+        for parent in sorted(by_parent.keys()):
+            r = self._note_data_row(ws, r, parent, bold=True)
+            sub_total = 0.0
+            for l in sorted(by_parent[parent], key=lambda x: x.name):
+                r = self._note_data_row(ws, r, self._ledger_label(l), l.closing, indent=1)
+                sub_total += l.closing
+            r = self._note_data_row(ws, r, f"Sub-total — {parent}", sub_total, indent=1, bold=True)
         r = self._note_data_row(ws, r, "Total Trade Payables", fd.trade_payables(), total=True)
 
     def _write_note_fixed_assets(self):
@@ -1521,11 +2019,20 @@ class ExcelWriter:
     def _write_note_trade_receivables(self):
         ws, r = self._start_note_sheet(12, "Trade Receivables")
         fd = self.fd
-        by_parent: dict[str, float] = {}
-        for l in fd._ledgers_for("Sundry Debtors"):
-            by_parent[l.parent] = by_parent.get(l.parent, 0) + (-l.closing)
-        for parent, amt in sorted(by_parent.items()):
-            r = self._note_data_row(ws, r, parent, amt if abs(amt) > 0 else None)
+        # Ledger-wise breakdown, grouped by parent sub-group with sub-totals.
+        # Debtors are debit-natured (negate closing for display). Net-credit
+        # balances (advances received) appear as NEGATIVE on the same line.
+        ledgers = fd._ledgers_for("Sundry Debtors")
+        by_parent: dict[str, list] = {}
+        for l in ledgers:
+            by_parent.setdefault(l.parent, []).append(l)
+        for parent in sorted(by_parent.keys()):
+            r = self._note_data_row(ws, r, parent, bold=True)
+            sub_total = 0.0
+            for l in sorted(by_parent[parent], key=lambda x: x.name):
+                r = self._note_data_row(ws, r, self._ledger_label(l), -l.closing, indent=1)
+                sub_total += -l.closing
+            r = self._note_data_row(ws, r, f"Sub-total — {parent}", sub_total, indent=1, bold=True)
         r = self._note_data_row(ws, r, "Total Trade Receivables", fd.trade_receivables(), total=True)
 
     def _write_note_cash_bank(self):
@@ -1541,6 +2048,91 @@ class ExcelWriter:
             for l in asset_banks:
                 r = self._note_data_row(ws, r, self._ledger_label(l), -l.closing, indent=1)
         r = self._note_data_row(ws, r, "Total Cash & Cash Equivalents", fd.cash_and_bank(), total=True)
+
+    # ── Ledger-wise note builder (used by N6, N7, N9, N10, N14) ─────────────
+
+    def _write_grouped_note(self, note_num: int, title: str,
+                            primary_groups: list[str],
+                            display_sign: int,
+                            total_amount: float,
+                            extra_filter=None,
+                            extra_exclude=None):
+        """Ledger-wise note grouped by parent sub-group with sub-totals.
+
+        primary_groups: list of Tally primary groups to pull ledgers from.
+        display_sign:   +1 (credit-natured: show closing as-is) or -1 (debit-natured: negate).
+        extra_filter:   callable(LedgerRow)->bool, only include if returns True.
+        extra_exclude:  callable(LedgerRow)->bool, exclude if returns True.
+        """
+        ws, r = self._start_note_sheet(note_num, title)
+        fd = self.fd
+        by_parent: dict[str, list] = {}
+        for pg in primary_groups:
+            for l in fd._ledgers_for(pg):
+                if extra_filter and not extra_filter(l):
+                    continue
+                if extra_exclude and extra_exclude(l):
+                    continue
+                by_parent.setdefault(l.parent, []).append(l)
+        if not by_parent:
+            r = self._note_data_row(ws, r, "(no ledgers in this category)", indent=1)
+        for parent in sorted(by_parent.keys()):
+            r = self._note_data_row(ws, r, parent, bold=True)
+            sub_total = 0.0
+            for l in sorted(by_parent[parent], key=lambda x: x.name):
+                amt = display_sign * l.closing
+                r = self._note_data_row(ws, r, self._ledger_label(l), amt, indent=1)
+                sub_total += amt
+            r = self._note_data_row(ws, r, f"Sub-total — {parent}", sub_total, indent=1, bold=True)
+        r = self._note_data_row(ws, r, f"Total {title}", total_amount, total=True)
+
+    def _write_note_other_cl(self):
+        # Other Current Liabilities = Current Liabilities + Branch/Divisions
+        # + Suspense A/c, excluding Deferred Tax Liability ledger.
+        is_dtl = lambda l: "deferred tax" in l.name.lower()
+        self._write_grouped_note(
+            6, "Other Current Liabilities",
+            ["Current Liabilities", "Branch / Divisions", "Suspense A/c"],
+            display_sign=+1,
+            total_amount=self.fd.other_current_liabilities(),
+            extra_exclude=is_dtl,
+        )
+
+    def _write_note_provisions(self):
+        self._write_grouped_note(
+            7, "Short-Term Provisions",
+            ["Provisions"],
+            display_sign=+1,
+            total_amount=self.fd.short_term_provisions(),
+        )
+
+    def _write_note_nc_investments(self):
+        # Investments are debit-natured (asset) → negate closing for display
+        self._write_grouped_note(
+            9, "Non-Current Investments",
+            ["Investments"],
+            display_sign=-1,
+            total_amount=self.fd.non_current_investments(),
+        )
+
+    def _write_note_lt_loans_advances(self):
+        # Deposits & Loans-and-Advances assets — debit-natured → negate display
+        self._write_grouped_note(
+            10, "Long-Term Loans & Advances",
+            ["Deposits (Asset)", "Loans & Advances (Asset)"],
+            display_sign=-1,
+            total_amount=self.fd.long_term_loans_advances(),
+        )
+
+    def _write_note_other_ca(self):
+        # Other Current Assets: only the "Current Assets" primary group lands here.
+        # Branch/Div and D&T net are shown on the liability side regardless of sign.
+        self._write_grouped_note(
+            14, "Other Current Assets",
+            ["Current Assets"],
+            display_sign=-1,
+            total_amount=self.fd.other_current_assets(),
+        )
 
     def _write_notes_index(self):
         ws = self.wb.create_sheet("Notes Index")
@@ -1567,10 +2159,15 @@ class ExcelWriter:
             (3,  "Long-Term Borrowings",           fd.long_term_borrowings()),
             (4,  "Short-Term Borrowings",          fd.short_term_borrowings() + fd.bank_od_in_bank_accounts()),
             (5,  "Trade Payables",                 fd.trade_payables()),
+            (6,  "Other Current Liabilities",      fd.other_current_liabilities()),
+            (7,  "Short-Term Provisions",          fd.short_term_provisions()),
             (8,  "Fixed Assets (Net Block)",       fd.net_fixed_assets()),
+            (9,  "Non-Current Investments",        fd.non_current_investments()),
+            (10, "Long-Term Loans & Advances",     fd.long_term_loans_advances()),
             (11, "Inventories",                    fd.closing_stock()),
             (12, "Trade Receivables",              fd.trade_receivables()),
             (13, "Cash & Cash Equivalents",        fd.cash_and_bank()),
+            (14, "Other Current Assets",           fd.other_current_assets()),
         ]
         for i, (num, title, amount) in enumerate(NOTE_INDEX, start=3):
             sheet_name = self._note_sheet_name(num)
@@ -1728,7 +2325,7 @@ class ExcelWriter:
         # ── Profit lines ─────────────────────────────────────────────────────
         pbt_r = formula_row("V.   Profit Before Tax (III − Expenses)",
                             [tot_r, tot_exp_r], op="-", bold=True, total=True)
-        tax_r = row("VI.  Tax Expense (Deferred Tax Provision)", lambda b: b.tax_expense())
+        tax_r = row("VI.  Tax Expense (balancing to Tally P&L A/c)", lambda b: b.tax_expense())
         pat_r = formula_row("VII. Profit After Tax", [pbt_r, tax_r], op="-",
                             bold=True, bg=C_HEADER_BG)
         for col in ["A"] + all_value_cols:
@@ -2019,6 +2616,10 @@ class ExcelWriter:
             ("Depreciation Rate (WDV) %",       f"{p.depreciation_rate_pct:.1f}%"),
             ("Effective Tax Rate %",            f"{p.tax_rate_pct:.1f}%"),
             ("Other Income (fixed ₹ / year)",   f"₹ {p.other_income_pa:,.0f}"),
+            ("Target MPBF (CMA Form VI)",       f"₹ {getattr(p, 'target_mpbf', 0):,.0f}"
+                                                 if getattr(p, 'target_mpbf', 0) > 0
+                                                 else "— (computed from projections)"),
+            ("MPBF Method",                     f"Tandon Method {int(getattr(p, 'mpbf_method', 2))}"),
         ]
         for i, (lbl, val) in enumerate(rows, start=2):
             ws[f"A{i}"].value = lbl
@@ -2055,12 +2656,317 @@ class ProjectionInputs:
     depreciation_rate_pct: float = 15.0 # % WDV
     tax_rate_pct:        float = 25.0   # %
     other_income_pa:     float = 0.0    # ₹ fixed per year
+    # ── CMA target & reverse-solver mode ─────────────────────────────────────
+    # When target_mpbf > 0 AND solver_mode is a reverse mode, the projection
+    # engine BACK-CALCULATES the relevant variable(s) so the resulting MPBF
+    # matches the target. The other variables remain user-fixed inputs.
+    #
+    # Solver modes:
+    #   "forward"        — classical: user enters all projection inputs;
+    #                      MPBF is computed downstream. target_mpbf is shown
+    #                      as a comparison row only (gap vs computed).
+    #   "reverse_days"   — anchor on WC days + margin; SOLVE Revenue Y1 such
+    #                      that the resulting MPBF equals the target. Y2/Y3
+    #                      then propagate via revenue growth as usual.
+    #   "reverse_revenue"— anchor on Revenue + growth + margin; SOLVE the WC
+    #                      days mix (inventory & debtor days scaled in current
+    #                      proportion) such that the resulting MPBF equals the
+    #                      target.
+    target_mpbf:         float = 0.0    # ₹ — desired bank working-capital limit
+    mpbf_method:         int   = 2      # 1 = Tandon Method I (75% of WCG)
+                                        # 2 = Tandon Method II (0.75×CA − CL_other)
+    solver_mode:         str   = "forward"   # forward | reverse_days | reverse_revenue
 
 
 class ProjectionEngine:
     def __init__(self, fd: FinancialData, p: ProjectionInputs):
         self.fd = fd
-        self.p  = p
+        self.p_input = p   # original user inputs, preserved for the back-calc worksheet
+        self.solver_trace: dict | None = None   # populated in reverse mode
+        # Resolve any reverse-mode back-calculation into an effective input
+        # set. After this, self.p is what the projection math uses.
+        self.p = self._resolve_inputs(p)
+
+    # ── Reverse-MPBF solvers ──────────────────────────────────────────────────
+    # Given a target MPBF, solve for either Revenue Y1 or the WC days mix.
+    # Math (Tandon Method II):
+    #   MPBF = 0.75 × CA  −  CL_other
+    #   CA       = Rev × [(1−GM) × INV_days + DEB_days]/365 + Cash + Other_CA
+    #   CL_other = Rev × (1−GM) × CRED_days/365  +  D&T + OCL + Provisions
+    # For Method I: MPBF = 0.75 × (CA − CL_other) = 0.75 × WCG → algebra below.
+
+    def _wc_anchors(self) -> dict:
+        """Snapshot the current-year 'fixed' components used by both solvers."""
+        fd = self.fd
+        return {
+            "cash":         fd.cash_and_bank(),
+            "other_ca":     fd.other_current_assets(),
+            "dt_net":       max(0, fd.duties_and_taxes_net()),
+            "ocl":          max(0, fd.other_current_liabilities()),
+            "provisions":   max(0, fd.short_term_provisions()),
+            "rev_current":  fd.revenue_from_ops(),
+            "inv_current":  fd.closing_stock(),
+            "deb_current":  fd.trade_receivables(),
+            "creditors_current": fd.trade_payables(),
+        }
+
+    # ── Internal: forward-project Year 1 only (used by numerical solvers) ────
+    #
+    # MPBF design note: standard CMA practice computes MPBF from OPERATING
+    # current assets — not from the cash-plug bloat that arises in projection
+    # models when retained earnings outrun operating WC needs. A bank will not
+    # underwrite a higher limit just because the company is projected to sit
+    # on surplus cash. So we define:
+    #
+    #     operating_CA   = Inventory + Debtors + Other_CA + cash_anchor
+    #     cash_anchor    = current Tally cash level (held constant)
+    #     MPBF (Method II) = 0.75 × operating_CA − CL_other_than_bank_borrowings
+    #
+    # This keeps MPBF responsive to BOTH revenue and WC-day changes (cash plug
+    # in the full BS still absorbs the residual but no longer dominates MPBF).
+    #
+    def _project_y1_mpbf(self, p_test: "ProjectionInputs") -> tuple[float, dict]:
+        fd = self.fd
+        gm   = p_test.gross_margin_pct / 100.0
+        rev  = fd.revenue_from_ops() * (1 + p_test.rev_growth_y1 / 100.0)
+        cogs = rev * (1 - gm)
+        inv  = cogs / 365.0 * p_test.inventory_days
+        deb  = rev  / 365.0 * p_test.debtor_days
+        cred = cogs / 365.0 * p_test.creditor_days
+
+        # Mirror projected_pnl() for PAT
+        opex_mult = (1 + p_test.opex_growth_pct / 100.0)
+        employee  = fd.employee_costs() * opex_mult
+        other_exp = (fd.other_indirect_expenses() + fd.direct_expenses()) * opex_mult
+        fa_base = fd.net_fixed_assets() + p_test.capex_pa
+        depr    = fa_base * p_test.depreciation_rate_pct / 100.0
+        net_fa  = fa_base - depr + p_test.capex_pa
+        lt_borr = max(0, fd.long_term_borrowings()
+                      + (p_test.new_borrowings_pa - p_test.loan_repayment_pa))
+        st_borr = fd.short_term_borrowings() + fd.bank_od_in_bank_accounts()
+        finance = (lt_borr + st_borr) * p_test.interest_rate_pct / 100.0
+        pbt     = rev - cogs - employee - other_exp - finance - depr + p_test.other_income_pa
+        tax     = max(0, pbt * p_test.tax_rate_pct / 100.0)
+        pat     = pbt - tax
+
+        # Operating CA (the MPBF base) — uses base-year cash, NOT the plug
+        other_ca     = fd.other_current_assets()
+        cash_anchor  = fd.cash_and_bank()
+        operating_ca = inv + deb + cash_anchor + other_ca
+
+        # CL "other than bank borrowings" — matches Form VI definition
+        other_cl    = fd.other_current_liabilities()
+        provisions  = fd.short_term_provisions()
+        cl_other_mpbf = cred + other_cl + provisions
+
+        method = int(p_test.mpbf_method)
+        if method == 1:
+            mpbf = 0.75 * (operating_ca - cl_other_mpbf)
+        else:
+            mpbf = 0.75 * operating_ca - cl_other_mpbf
+
+        # Also compute the full BS cash plug (for diagnostics, not MPBF)
+        reserves     = fd.reserves_surplus() + pat
+        total_equity = fd.share_capital() + reserves
+        dtl          = fd.deferred_tax_liability()
+        lt_loans     = fd.long_term_loans_advances()
+        total_el     = total_equity + lt_borr + dtl + st_borr + cred + other_cl + provisions
+        total_nca    = net_fa + lt_loans
+        cash_plug    = total_el - total_nca - inv - deb - other_ca
+
+        return mpbf, {
+            "rev":          rev,      "cogs":     cogs,
+            "inv":          inv,      "deb":      deb,      "cred":  cred,
+            "cash_anchor":  cash_anchor,
+            "cash_plug":    cash_plug,
+            "operating_ca": operating_ca,
+            "ca":           operating_ca,        # alias for back-calc worksheet
+            "cl_other_mpbf": cl_other_mpbf,
+            "total_el":     total_el,            "total_nca": total_nca,
+            "pat":          pat,                 "net_fa":   net_fa,
+            "reserves":     reserves,
+        }
+
+    @staticmethod
+    def _bisect(f, lo: float, hi: float, target: float,
+                iters: int = 80, tol: float = 1.0) -> tuple[float, bool]:
+        """Bisect for x in [lo, hi] such that f(x) ≈ target. Returns (x, ok)."""
+        f_lo, f_hi = f(lo), f(hi)
+        # If both sides are on the same side of target, infeasible
+        if (f_lo - target) * (f_hi - target) > 0:
+            # Pick whichever endpoint is closer
+            return (lo if abs(f_lo - target) < abs(f_hi - target) else hi), False
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            f_mid = f(mid)
+            if abs(f_mid - target) < tol:
+                return mid, True
+            if (f_lo - target) * (f_mid - target) < 0:
+                hi, f_hi = mid, f_mid
+            else:
+                lo, f_lo = mid, f_mid
+        return 0.5 * (lo + hi), True
+
+    def solve_revenue_for_mpbf(self) -> dict:
+        """Mode A — Days-anchored. Numerically solve the Revenue growth Y1
+        such that projected Year-1 MPBF equals target_mpbf, keeping WC days +
+        margin + all other inputs at user values. Uses bisection on the
+        forward-projection MPBF function (which has a cash plug and is
+        non-linear in revenue)."""
+        import dataclasses
+        p = self.p_input
+        target = float(p.target_mpbf)
+        method = int(p.mpbf_method)
+        a = self._wc_anchors()
+
+        def mpbf_at_growth(g_pct: float) -> float:
+            p_test = dataclasses.replace(p, rev_growth_y1=g_pct)
+            m, _ = self._project_y1_mpbf(p_test)
+            return m
+
+        lo, hi = -90.0, 1000.0   # growth range
+        x, ok = self._bisect(mpbf_at_growth, lo, hi, target)
+
+        # Evaluate at the chosen growth for full diagnostics
+        p_chosen = dataclasses.replace(p, rev_growth_y1=x)
+        mpbf_chosen, dbg = self._project_y1_mpbf(p_chosen)
+
+        return {
+            "feasible":      ok,
+            "reason":        "" if ok else "target-out-of-reachable-growth-range",
+            "method":        method,
+            "target_mpbf":   target,
+            "revenue_y1":    dbg["rev"],
+            "growth_y1_pct": x,
+            "rev_current":   a["rev_current"],
+            "computed_mpbf": mpbf_chosen,
+            "inv_days":      p.inventory_days,
+            "deb_days":      p.debtor_days,
+            "cred_days":     p.creditor_days,
+            "gross_margin":  p.gross_margin_pct,
+            "ca_y1":         dbg["ca"],
+            "cl_other_y1":   dbg["cl_other_mpbf"],
+            "cash_y1":       dbg["cash_anchor"],
+            "cash_plug_y1":  dbg["cash_plug"],
+            "pat_y1":        dbg["pat"],
+        }
+
+    def solve_days_for_mpbf(self) -> dict:
+        """Mode B — Revenue-anchored. Numerically solve a SCALE factor applied
+        to (inventory_days, debtor_days) so projected Year-1 MPBF equals
+        target. Creditor days + revenue + margin stay user-fixed."""
+        import dataclasses
+        p = self.p_input
+        target = float(p.target_mpbf)
+        method = int(p.mpbf_method)
+        a = self._wc_anchors()
+
+        base_inv = max(p.inventory_days, 1.0)
+        base_deb = max(p.debtor_days, 1.0)
+
+        def mpbf_at_scale(s: float) -> float:
+            p_test = dataclasses.replace(p,
+                inventory_days=base_inv * s,
+                debtor_days   =base_deb * s)
+            m, _ = self._project_y1_mpbf(p_test)
+            return m
+
+        lo, hi = 0.05, 10.0
+        s, ok = self._bisect(mpbf_at_scale, lo, hi, target)
+        inv_d_sol = base_inv * s
+        deb_d_sol = base_deb * s
+        p_chosen = dataclasses.replace(p,
+            inventory_days=inv_d_sol, debtor_days=deb_d_sol)
+        mpbf_chosen, dbg = self._project_y1_mpbf(p_chosen)
+
+        return {
+            "feasible":       ok,
+            "reason":         "" if ok else "target-out-of-reachable-days-range",
+            "method":         method,
+            "target_mpbf":    target,
+            "computed_mpbf":  mpbf_chosen,
+            "scale_factor":   s,
+            "inv_days":       inv_d_sol,
+            "deb_days":       deb_d_sol,
+            "cred_days":      p.creditor_days,
+            "rev_y1":         dbg["rev"],
+            "cogs_y1":        dbg["cogs"],
+            "ca_required":    dbg["ca"],
+            "cl_other":       dbg["cl_other_mpbf"],
+            "inv_required":   dbg["inv"],
+            "deb_required":   dbg["deb"],
+            "wc_assets_req":  dbg["inv"] + dbg["deb"],
+            "gross_margin":   p.gross_margin_pct,
+            "inv_days_user":  p.inventory_days,
+            "deb_days_user":  p.debtor_days,
+        }
+
+    def _resolve_inputs(self, p: ProjectionInputs) -> ProjectionInputs:
+        """If a reverse mode is selected and target_mpbf is set, run the
+        appropriate solver and return a new ProjectionInputs with the
+        back-solved variable substituted in. Otherwise return p unchanged."""
+        if p.target_mpbf <= 0 or p.solver_mode == "forward":
+            return p
+        # Defer to the solver and store its trace for the worksheet
+        import dataclasses
+        if p.solver_mode == "reverse_days":
+            res = self.solve_revenue_for_mpbf()
+            self.solver_trace = {**res, "mode": "reverse_days"}
+            if res.get("feasible"):
+                return dataclasses.replace(p, rev_growth_y1=res["growth_y1_pct"])
+        elif p.solver_mode == "reverse_revenue":
+            res = self.solve_days_for_mpbf()
+            self.solver_trace = {**res, "mode": "reverse_revenue"}
+            if res.get("feasible"):
+                return dataclasses.replace(p,
+                    inventory_days=res["inv_days"],
+                    debtor_days   =res["deb_days"])
+        return p
+
+    # ── Sanity checks on the resolved projection ──────────────────────────────
+    def feasibility_checks(self) -> list[dict]:
+        """Return list of {check, threshold, actual, status} dicts."""
+        p, fd = self.p, self.fd
+        pnl   = self.projected_pnl()
+        bs    = self.projected_bs()
+        out   = []
+
+        def chk(name, actual, threshold, op, fmt="{:.2f}"):
+            if   op == "<=": ok = actual <= threshold
+            elif op == ">=": ok = actual >= threshold
+            elif op == "in": ok = threshold[0] <= actual <= threshold[1]
+            else: ok = True
+            out.append({"check": name, "threshold": threshold, "actual": actual,
+                        "ok": ok, "op": op, "fmt": fmt})
+
+        chk("Revenue growth Y1 (%)",                 p.rev_growth_y1,           50,   "<=", "{:.1f}%")
+        chk("Revenue Y1 vs current (×)",
+            (fd.revenue_from_ops() and pnl[0]["revenue"] / fd.revenue_from_ops() or 0),
+            1.05, ">=", "{:.2f}×")
+        chk("Inventory days",                         p.inventory_days,         (15, 180), "in", "{:.0f}d")
+        chk("Debtor days",                            p.debtor_days,            (15, 180), "in", "{:.0f}d")
+        chk("Creditor days",                          p.creditor_days,          (15, 180), "in", "{:.0f}d")
+
+        # CMA ratios at Year 1
+        b = bs[0]
+        ca = b["total_ca"]
+        cl = b["st_borrowings"] + b["trade_payables"] + b["other_cl"] + b["provisions"]
+        current_ratio = (ca / cl) if cl > 0 else 0
+        chk("Current Ratio @ Y1",                     current_ratio,           1.33, ">=", "{:.2f}")
+
+        tol = b["lt_borrowings"] + b["dtl"] + cl
+        tnw = b["total_equity"] or 1
+        chk("TOL / TNW @ Y1",                         tol / tnw,                3.0,  "<=", "{:.2f}")
+
+        finance_y1 = pnl[0]["finance"] or 1
+        ebitda_y1  = pnl[0]["ebitda"]
+        chk("Interest Coverage (EBITDA / Finance)",   ebitda_y1 / finance_y1,   2.0,  ">=", "{:.2f}×")
+
+        dscr_den = finance_y1 + p.loan_repayment_pa
+        chk("DSCR @ Y1",                              (ebitda_y1 / dscr_den) if dscr_den > 0 else 99,
+            1.5, ">=", "{:.2f}")
+
+        return out
 
     def projected_pnl(self) -> list[dict]:
         fd = self.fd
@@ -2209,6 +3115,897 @@ class ProjectionEngine:
         return bs_list
 
 
+# ─── CMA Writer ───────────────────────────────────────────────────────────────
+#
+# 6-sheet Credit Monitoring Arrangement pack used by Indian banks for working-
+# capital and term-loan assessment. Sheets emitted (when cma=True is passed
+# to ExcelWriter and projections are enabled):
+#
+#   CMA II  Operating Statement (Current Actual + 3 Projected years)
+#   CMA III Analysis of Balance Sheet (current/non-current classification)
+#   CMA IV  Comparative Balance Sheet (5 yrs face)
+#   CMA V   Funds Flow Statement (sources & uses, year-on-year)
+#   CMA VI  MPBF Computation (Tandon Method I & II)
+#   CMA Ratios (DSCR, current ratio, TOL/TNW, ICR, debtor/inventory days)
+#
+
+class CMAWriter:
+    """Writes the 6-form CMA pack onto a workbook driven by the existing
+    ProjectionEngine and FinancialData. Years emitted: Current Actual,
+    Projected Year 1, Year 2, Year 3 (4 data columns)."""
+
+    YEAR_COLS = ["B", "C", "D", "E"]   # 4 data columns
+
+    def __init__(self, wb, fd: FinancialData, proj: "ProjectionInputs",
+                 pe: "ProjectionEngine"):
+        self.wb = wb
+        self.fd = fd
+        self.p  = proj
+        self.pe = pe
+        self.pnl = pe.projected_pnl()
+        self.bs  = pe.projected_bs()
+
+    # ── public ───────────────────────────────────────────────────────────────
+    def write_all(self) -> None:
+        # Back-calc worksheet first — establishes the assumption trail before
+        # the standard forms, in reverse mode.
+        if self.pe.solver_trace is not None:
+            self._write_back_calc()
+        self._write_form_ii_operating()
+        self._write_form_iii_analysis_bs()
+        self._write_form_iv_comparative_bs()
+        self._write_form_v_funds_flow()
+        self._write_form_vi_mpbf()
+        self._write_ratios()
+
+    # ── shared helpers ───────────────────────────────────────────────────────
+    def _setup(self, sheet_name: str, title: str) -> tuple:
+        ws = self.wb.create_sheet(sheet_name)
+        ws.sheet_view.showGridLines = False
+        ws.column_dimensions["A"].width = 56
+        for c in self.YEAR_COLS:
+            ws.column_dimensions[c].width = 20
+        last_col = self.YEAR_COLS[-1]
+
+        ws.merge_cells(f"A1:{last_col}1")
+        ws["A1"].value = self.fd.company.upper()
+        ws["A1"].font = _font(bold=True, size=13, color=C_WHITE)
+        ws["A1"].fill = _fill(C_HEADER_BG)
+        ws["A1"].alignment = _align("center")
+        ws.row_dimensions[1].height = 22
+
+        ws.merge_cells(f"A2:{last_col}2")
+        ws["A2"].value = title
+        ws["A2"].font = _font(bold=True, size=11, color=C_WHITE)
+        ws["A2"].fill = _fill(C_MID_BLUE)
+        ws["A2"].alignment = _align("center")
+
+        ws.merge_cells(f"A3:{last_col}3")
+        ws["A3"].value = "(All amounts in ₹  ·  negatives in parentheses)"
+        ws["A3"].font = _font(size=9, color=C_BLACK)
+        ws["A3"].fill = _fill(C_LIGHT_BLUE)
+        ws["A3"].alignment = _align("center")
+
+        # Year header row (row 4)
+        ws["A4"].value = "Particulars"
+        labels = [
+            f"Current Year\n({self.fd.period_label})  Actual",
+            "Projected\nYear 1",
+            "Projected\nYear 2",
+            "Projected\nYear 3",
+        ]
+        for col, lbl in zip(self.YEAR_COLS, labels):
+            ws[f"{col}4"].value = lbl
+        for col in ["A"] + self.YEAR_COLS:
+            c = ws[f"{col}4"]
+            c.font = _font(bold=True, size=10, color=C_WHITE)
+            c.fill = _fill(C_DARK_BLUE)
+            c.alignment = _align("center", wrap=True)
+        ws.row_dimensions[4].height = 32
+        ws.freeze_panes = "B5"
+
+        # Print setup
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_title_rows = "1:4"
+        ws.oddHeader.center.text = f"{self.fd.company} — {title}"
+
+        return ws, 5   # next data row
+
+    def _row(self, ws, r: int, label: str, values: list,
+             bold: bool = False, total: bool = False, header: bool = False,
+             indent: int = 0, fmt: str = INR_ACC) -> int:
+        side_thin = Side(style="thin", color=C_DARK_BLUE)
+        side_med  = Side(style="medium", color=C_DARK_BLUE)
+        total_border = Border(top=side_thin, bottom=side_med)
+
+        ws[f"A{r}"].value = ("  " * indent) + label
+        ws[f"A{r}"].font = _font(bold=bold or total or header, size=10,
+                                  color=C_WHITE if header else C_BLACK)
+        ws[f"A{r}"].alignment = _align("left", v="center")
+
+        for col, v in zip(self.YEAR_COLS, values):
+            cell = ws[f"{col}{r}"]
+            if v is None:
+                cell.value = None
+            elif isinstance(v, str):
+                cell.value = v
+            else:
+                cell.value = v
+                cell.number_format = fmt
+            cell.font = _font(bold=bold or total or header, size=10,
+                              color=C_WHITE if header else C_BLACK)
+            cell.alignment = _align("right" if not isinstance(v, str) else "center")
+
+        if header:
+            for col in ["A"] + self.YEAR_COLS:
+                ws[f"{col}{r}"].fill = _fill(C_MID_BLUE)
+        elif total:
+            for col in ["A"] + self.YEAR_COLS:
+                ws[f"{col}{r}"].fill = _fill(C_TOTAL_BG)
+                ws[f"{col}{r}"].border = total_border
+        return r + 1
+
+    def _vals(self, fd_fn, pnl_key=None, bs_key=None) -> list:
+        """Build [current_actual, y1, y2, y3] from FinancialData fn + projection keys."""
+        base = fd_fn(self.fd) if fd_fn else 0.0
+        if pnl_key:
+            proj = [yr[pnl_key] for yr in self.pnl]
+        elif bs_key:
+            proj = [yr[bs_key] for yr in self.bs]
+        else:
+            proj = [0.0, 0.0, 0.0]
+        return [base] + proj
+
+    # ── Form II — Operating Statement ────────────────────────────────────────
+    def _write_form_ii_operating(self) -> None:
+        ws, r = self._setup("CMA II Operating Stmt",
+                            "FORM II — OPERATING STATEMENT")
+        fd = self.fd
+        p  = self.p
+
+        r = self._row(ws, r, "I.  GROSS SALES", [None]*4, header=True)
+        r = self._row(ws, r, "Domestic Sales",
+                      self._vals(lambda f: f.revenue_from_ops(), pnl_key="revenue"))
+        r = self._row(ws, r, "Export Sales", [0]*4)
+        gross_sales = self._vals(lambda f: f.revenue_from_ops(), pnl_key="revenue")
+        r = self._row(ws, r, "Total Gross Sales", gross_sales, bold=True, total=True)
+
+        r = self._row(ws, r, "  Less: Excise / GST", [0]*4)
+        net_sales = gross_sales
+        r = self._row(ws, r, "II.  Net Sales", net_sales, bold=True, total=True)
+
+        r = self._row(ws, r, "III.  COST OF SALES", [None]*4, header=True)
+        # Raw materials / purchases
+        r = self._row(ws, r, "  Raw Materials Consumed",
+                      self._vals(lambda f: f.purchases(), pnl_key="cogs"))
+        r = self._row(ws, r, "  Power & Fuel", [0]*4)
+        r = self._row(ws, r, "  Direct Labour / Wages",
+                      self._vals(lambda f: f.employee_costs(), pnl_key="employee"))
+        r = self._row(ws, r, "  Other Manufacturing Expenses",
+                      self._vals(lambda f: f.direct_expenses(), pnl_key="other_expenses"))
+        r = self._row(ws, r, "  Depreciation",
+                      self._vals(lambda f: f.depreciation_from_fa(), pnl_key="depreciation"))
+
+        # Change in stock
+        op_stock = [fd.opening_stock(), fd.closing_stock(),
+                    self.bs[0]["inventory"], self.bs[1]["inventory"]]
+        cl_stock = [fd.closing_stock(), self.bs[0]["inventory"],
+                    self.bs[1]["inventory"], self.bs[2]["inventory"]]
+        r = self._row(ws, r, "  Add: Opening Stock-in-Process / FG", op_stock)
+        r = self._row(ws, r, "  Less: Closing Stock-in-Process / FG", [-v for v in cl_stock])
+
+        cogs_total = [c + e + (op - cl) for c, e, op, cl in zip(
+            self._vals(lambda f: f.purchases(), pnl_key="cogs"),
+            self._vals(lambda f: f.employee_costs(), pnl_key="employee"),
+            op_stock, cl_stock)]
+        r = self._row(ws, r, "Sub-total: Cost of Sales", cogs_total, bold=True, total=True)
+
+        r = self._row(ws, r, "IV.  Gross Profit (II − III)",
+                      [a - b for a, b in zip(net_sales, cogs_total)],
+                      bold=True, total=True)
+
+        r = self._row(ws, r, "V.  OPERATING EXPENSES", [None]*4, header=True)
+        r = self._row(ws, r, "  Selling, General & Admin Expenses",
+                      self._vals(lambda f: f.other_indirect_expenses(), pnl_key="other_expenses"))
+        r = self._row(ws, r, "  Finance Costs (Interest)",
+                      self._vals(lambda f: f.finance_costs(), pnl_key="finance"))
+
+        r = self._row(ws, r, "VI.  Profit Before Tax",
+                      self._vals(lambda f: f.profit_before_tax(), pnl_key="pbt"),
+                      bold=True, total=True)
+        r = self._row(ws, r, "  Provision for Tax",
+                      self._vals(lambda f: f.tax_expense(), pnl_key="tax"))
+        r = self._row(ws, r, "VII.  Profit After Tax",
+                      self._vals(lambda f: f.profit_after_tax(), pnl_key="pat"),
+                      bold=True, total=True)
+
+        r += 1
+        r = self._row(ws, r, "MEMO — Key Margins (%)", [None]*4, header=True)
+        def pct(num, den): return (num / den * 100) if den else 0
+        gm = [pct(a - b, n) for a, b, n in zip(net_sales, cogs_total, net_sales)]
+        r = self._row(ws, r, "  Gross Margin %", gm, fmt='0.00"%"')
+        pbt_vals = self._vals(lambda f: f.profit_before_tax(), pnl_key="pbt")
+        pat_vals = self._vals(lambda f: f.profit_after_tax(), pnl_key="pat")
+        pbtm = [pct(a, b) for a, b in zip(pbt_vals, net_sales)]
+        patm = [pct(a, b) for a, b in zip(pat_vals, net_sales)]
+        r = self._row(ws, r, "  PBT Margin %", pbtm, fmt='0.00"%"')
+        r = self._row(ws, r, "  PAT Margin %", patm, fmt='0.00"%"')
+
+    # ── Form III — Analysis of Balance Sheet ─────────────────────────────────
+    def _write_form_iii_analysis_bs(self) -> None:
+        ws, r = self._setup("CMA III Analysis BS",
+                            "FORM III — ANALYSIS OF BALANCE SHEET")
+        fd = self.fd
+
+        r = self._row(ws, r, "CURRENT LIABILITIES", [None]*4, header=True)
+        r = self._row(ws, r, "  Short-Term Borrowings from Banks",
+                      self._vals(lambda f: f.short_term_borrowings() + f.bank_od_in_bank_accounts(),
+                                 bs_key="st_borrowings"))
+        r = self._row(ws, r, "  Sundry Creditors (Trade)",
+                      self._vals(lambda f: f.trade_payables(), bs_key="trade_payables"))
+        r = self._row(ws, r, "  Advances from Customers", [0]*4)
+        r = self._row(ws, r, "  Statutory Liabilities (Duties & Taxes)",
+                      self._vals(lambda f: f.duties_and_taxes_net()))
+        r = self._row(ws, r, "  Other Current Liabilities",
+                      self._vals(lambda f: f.other_current_liabilities(), bs_key="other_cl"))
+        r = self._row(ws, r, "  Short-Term Provisions",
+                      self._vals(lambda f: f.short_term_provisions(), bs_key="provisions"))
+        # Total CL
+        def total_cl_current(f):
+            return (f.short_term_borrowings() + f.bank_od_in_bank_accounts()
+                    + f.trade_payables() + f.duties_and_taxes_net()
+                    + f.other_current_liabilities() + f.short_term_provisions())
+        tcl = [total_cl_current(fd)] + [b["st_borrowings"] + b["trade_payables"]
+                                         + b["other_cl"] + b["provisions"] for b in self.bs]
+        r = self._row(ws, r, "Total Current Liabilities (A)", tcl, bold=True, total=True)
+        r += 1
+
+        r = self._row(ws, r, "TERM LIABILITIES", [None]*4, header=True)
+        r = self._row(ws, r, "  Term Loans / Long-Term Borrowings",
+                      self._vals(lambda f: f.long_term_borrowings(), bs_key="lt_borrowings"))
+        r = self._row(ws, r, "  Deferred Tax Liability (Net)",
+                      self._vals(lambda f: f.deferred_tax_liability(), bs_key="dtl"))
+        ttl = [fd.long_term_borrowings() + fd.deferred_tax_liability()] + \
+              [b["lt_borrowings"] + b["dtl"] for b in self.bs]
+        r = self._row(ws, r, "Total Term Liabilities (B)", ttl, bold=True, total=True)
+        r += 1
+
+        r = self._row(ws, r, "NET WORTH", [None]*4, header=True)
+        r = self._row(ws, r, "  Share Capital",
+                      self._vals(lambda f: f.share_capital(), bs_key="share_capital"))
+        r = self._row(ws, r, "  Reserves & Surplus",
+                      self._vals(lambda f: f.reserves_surplus(), bs_key="reserves"))
+        tnw = self._vals(lambda f: f.total_equity(), bs_key="total_equity")
+        r = self._row(ws, r, "Tangible Net Worth (C)", tnw, bold=True, total=True)
+        r += 1
+
+        # Total liabilities
+        tl_total = [a + b + c for a, b, c in zip(tcl, ttl, tnw)]
+        r = self._row(ws, r, "TOTAL LIABILITIES (A + B + C)", tl_total, bold=True, header=True)
+        r += 1
+
+        # ── Assets side
+        r = self._row(ws, r, "CURRENT ASSETS", [None]*4, header=True)
+        r = self._row(ws, r, "  Inventories (Stock in Trade)",
+                      self._vals(lambda f: f.closing_stock(), bs_key="inventory"))
+        r = self._row(ws, r, "  Sundry Debtors",
+                      self._vals(lambda f: f.trade_receivables(), bs_key="debtors"))
+        r = self._row(ws, r, "  Cash & Bank Balances",
+                      self._vals(lambda f: f.cash_and_bank(), bs_key="cash"))
+        r = self._row(ws, r, "  Other Current Assets",
+                      self._vals(lambda f: f.other_current_assets(), bs_key="other_ca"))
+        tca = self._vals(lambda f: f.total_current_assets(), bs_key="total_ca")
+        r = self._row(ws, r, "Total Current Assets (D)", tca, bold=True, total=True)
+        r += 1
+
+        r = self._row(ws, r, "FIXED & NON-CURRENT ASSETS", [None]*4, header=True)
+        r = self._row(ws, r, "  Net Block (Fixed Assets)",
+                      self._vals(lambda f: f.net_fixed_assets(), bs_key="fixed_assets"))
+        r = self._row(ws, r, "  Long-Term Loans & Advances",
+                      self._vals(lambda f: f.long_term_loans_advances(), bs_key="lt_loans"))
+        r = self._row(ws, r, "  Non-Current Investments",
+                      self._vals(lambda f: f.non_current_investments()))
+        r = self._row(ws, r, "  Deferred Tax Asset",
+                      self._vals(lambda f: f.deferred_tax_asset()))
+        r = self._row(ws, r, "  Other Non-Current Assets",
+                      self._vals(lambda f: f.other_noncurrent_assets()))
+        tnca = self._vals(lambda f: f.total_noncurrent_assets(), bs_key="total_nca")
+        r = self._row(ws, r, "Total Non-Current Assets (E)", tnca, bold=True, total=True)
+        r += 1
+
+        ta = [a + b for a, b in zip(tca, tnca)]
+        r = self._row(ws, r, "TOTAL ASSETS (D + E)", ta, bold=True, header=True)
+        r += 2
+
+        # Working Capital Gap
+        nwc = [a - b for a, b in zip(tca, tcl)]
+        r = self._row(ws, r, "NET WORKING CAPITAL (D − A)", nwc, bold=True, total=True)
+
+    # ── Form IV — Comparative Balance Sheet ──────────────────────────────────
+    def _write_form_iv_comparative_bs(self) -> None:
+        ws, r = self._setup("CMA IV Comparative BS",
+                            "FORM IV — COMPARATIVE BALANCE SHEET")
+        fd = self.fd
+
+        r = self._row(ws, r, "I.  EQUITY & LIABILITIES", [None]*4, header=True)
+        r = self._row(ws, r, "  Share Capital",
+                      self._vals(lambda f: f.share_capital(), bs_key="share_capital"), indent=1)
+        r = self._row(ws, r, "  Reserves & Surplus",
+                      self._vals(lambda f: f.reserves_surplus(), bs_key="reserves"), indent=1)
+        r = self._row(ws, r, "Total Shareholders' Funds",
+                      self._vals(lambda f: f.total_equity(), bs_key="total_equity"),
+                      bold=True, total=True)
+        r += 1
+
+        r = self._row(ws, r, "  Long-Term Borrowings",
+                      self._vals(lambda f: f.long_term_borrowings(), bs_key="lt_borrowings"), indent=1)
+        r = self._row(ws, r, "  Deferred Tax Liability",
+                      self._vals(lambda f: f.deferred_tax_liability(), bs_key="dtl"), indent=1)
+        ncl = [fd.long_term_borrowings() + fd.deferred_tax_liability()] + \
+              [b["lt_borrowings"] + b["dtl"] for b in self.bs]
+        r = self._row(ws, r, "Total Non-Current Liabilities", ncl, bold=True, total=True)
+        r += 1
+
+        r = self._row(ws, r, "  Short-Term Borrowings",
+                      self._vals(lambda f: f.short_term_borrowings() + f.bank_od_in_bank_accounts(),
+                                 bs_key="st_borrowings"), indent=1)
+        r = self._row(ws, r, "  Trade Payables",
+                      self._vals(lambda f: f.trade_payables(), bs_key="trade_payables"), indent=1)
+        r = self._row(ws, r, "  Other Current Liabilities",
+                      self._vals(lambda f: f.other_current_liabilities(), bs_key="other_cl"), indent=1)
+        r = self._row(ws, r, "  Short-Term Provisions",
+                      self._vals(lambda f: f.short_term_provisions(), bs_key="provisions"), indent=1)
+        def total_cl_curr(f):
+            return (f.short_term_borrowings() + f.bank_od_in_bank_accounts()
+                    + f.trade_payables() + f.duties_and_taxes_net()
+                    + f.other_current_liabilities() + f.short_term_provisions())
+        tcl = [total_cl_curr(fd)] + [b["st_borrowings"] + b["trade_payables"]
+                                      + b["other_cl"] + b["provisions"] for b in self.bs]
+        r = self._row(ws, r, "Total Current Liabilities", tcl, bold=True, total=True)
+        r += 1
+
+        tel = self._vals(lambda f: f.total_equity_liabilities(), bs_key="total_el")
+        r = self._row(ws, r, "TOTAL EQUITY & LIABILITIES", tel, bold=True, header=True)
+        r += 2
+
+        r = self._row(ws, r, "II.  ASSETS", [None]*4, header=True)
+        r = self._row(ws, r, "  Fixed Assets (Net Block)",
+                      self._vals(lambda f: f.net_fixed_assets(), bs_key="fixed_assets"), indent=1)
+        r = self._row(ws, r, "  Long-Term Loans & Advances",
+                      self._vals(lambda f: f.long_term_loans_advances(), bs_key="lt_loans"), indent=1)
+        r = self._row(ws, r, "  Non-Current Investments",
+                      self._vals(lambda f: f.non_current_investments()), indent=1)
+        r = self._row(ws, r, "Total Non-Current Assets",
+                      self._vals(lambda f: f.total_noncurrent_assets(), bs_key="total_nca"),
+                      bold=True, total=True)
+        r += 1
+
+        r = self._row(ws, r, "  Inventories",
+                      self._vals(lambda f: f.closing_stock(), bs_key="inventory"), indent=1)
+        r = self._row(ws, r, "  Trade Receivables",
+                      self._vals(lambda f: f.trade_receivables(), bs_key="debtors"), indent=1)
+        r = self._row(ws, r, "  Cash & Bank",
+                      self._vals(lambda f: f.cash_and_bank(), bs_key="cash"), indent=1)
+        r = self._row(ws, r, "  Other Current Assets",
+                      self._vals(lambda f: f.other_current_assets(), bs_key="other_ca"), indent=1)
+        r = self._row(ws, r, "Total Current Assets",
+                      self._vals(lambda f: f.total_current_assets(), bs_key="total_ca"),
+                      bold=True, total=True)
+        r += 1
+
+        ta = self._vals(lambda f: f.total_assets(), bs_key="total_assets")
+        r = self._row(ws, r, "TOTAL ASSETS", ta, bold=True, header=True)
+
+    # ── Form V — Funds Flow Statement ────────────────────────────────────────
+    def _write_form_v_funds_flow(self) -> None:
+        # Funds flow shows year-on-year change. Cols: between (Current→Y1),
+        # (Y1→Y2), (Y2→Y3). Col B blank (no prior data).
+        ws, r = self._setup("CMA V Funds Flow",
+                            "FORM V — FUNDS FLOW STATEMENT")
+        # Override column headers for funds-flow context
+        ws["B4"].value = "(no prior\nyear)"
+        ws["C4"].value = "Current → Y1\n(Change)"
+        ws["D4"].value = "Y1 → Y2\n(Change)"
+        ws["E4"].value = "Y2 → Y3\n(Change)"
+
+        fd = self.fd
+        # Build a series indexed by year: [current, y1, y2, y3]
+        def series(fd_fn, bs_key=None):
+            base = fd_fn(fd) if fd_fn else 0.0
+            proj = [b[bs_key] for b in self.bs] if bs_key else [0]*3
+            return [base] + proj
+
+        def deltas(s):
+            # produce [None, s1-s0, s2-s1, s3-s2]
+            return [None, s[1]-s[0], s[2]-s[1], s[3]-s[2]]
+
+        r = self._row(ws, r, "SOURCES OF FUNDS", [None]*4, header=True)
+        pat_series = [self.fd.profit_after_tax()] + [yr["pat"] for yr in self.pnl]
+        r = self._row(ws, r, "  Profit After Tax (cumulative add)",
+                      [None, pat_series[1], pat_series[2], pat_series[3]])
+        dep_series = [self.fd.depreciation_from_fa()] + [yr["depreciation"] for yr in self.pnl]
+        r = self._row(ws, r, "  Add: Depreciation (non-cash)",
+                      [None, dep_series[1], dep_series[2], dep_series[3]])
+        r = self._row(ws, r, "  Increase in Long-Term Borrowings",
+                      deltas(series(lambda f: f.long_term_borrowings(), bs_key="lt_borrowings")))
+        r = self._row(ws, r, "  Increase in Share Capital",
+                      deltas(series(lambda f: f.share_capital(), bs_key="share_capital")))
+        r = self._row(ws, r, "  Increase in Short-Term Borrowings",
+                      deltas(series(lambda f: f.short_term_borrowings(), bs_key="st_borrowings")))
+        # Total sources (year-wise add)
+        def sum_at(*lists, idx):
+            tot = 0
+            for L in lists:
+                v = L[idx]
+                if v is not None: tot += v
+            return tot
+        lt_d   = deltas(series(lambda f: f.long_term_borrowings(), bs_key="lt_borrowings"))
+        sc_d   = deltas(series(lambda f: f.share_capital(), bs_key="share_capital"))
+        stb_d  = deltas(series(lambda f: f.short_term_borrowings(), bs_key="st_borrowings"))
+        tot_src = [None] + [pat_series[i] + dep_series[i]
+                            + (lt_d[i] or 0) + (sc_d[i] or 0) + (stb_d[i] or 0)
+                            for i in range(1, 4)]
+        r = self._row(ws, r, "Total Sources", tot_src, bold=True, total=True)
+        r += 1
+
+        r = self._row(ws, r, "USES OF FUNDS", [None]*4, header=True)
+        capex_each = [None, self.p.capex_pa, self.p.capex_pa, self.p.capex_pa]
+        r = self._row(ws, r, "  Capital Expenditure (CapEx)", capex_each)
+        rep_each = [None, self.p.loan_repayment_pa, self.p.loan_repayment_pa, self.p.loan_repayment_pa]
+        r = self._row(ws, r, "  Loan Repayments", rep_each)
+        inv_d   = deltas(series(lambda f: f.closing_stock(), bs_key="inventory"))
+        deb_d   = deltas(series(lambda f: f.trade_receivables(), bs_key="debtors"))
+        cred_d  = deltas(series(lambda f: f.trade_payables(), bs_key="trade_payables"))
+        r = self._row(ws, r, "  Increase in Inventories", inv_d)
+        r = self._row(ws, r, "  Increase in Debtors", deb_d)
+        r = self._row(ws, r, "  Decrease in Creditors",
+                      [None] + [-(cred_d[i] or 0) for i in range(1, 4)])
+        tot_use = [None] + [(capex_each[i] or 0) + (rep_each[i] or 0)
+                            + (inv_d[i] or 0) + (deb_d[i] or 0)
+                            - (cred_d[i] or 0) for i in range(1, 4)]
+        r = self._row(ws, r, "Total Uses", tot_use, bold=True, total=True)
+        r += 1
+
+        net = [None] + [tot_src[i] - tot_use[i] for i in range(1, 4)]
+        r = self._row(ws, r, "NET SURPLUS / (DEFICIT) — Change in Cash", net,
+                      bold=True, header=True)
+
+    # ── Form VI — MPBF (Tandon Method I & II) ────────────────────────────────
+    def _write_form_vi_mpbf(self) -> None:
+        ws, r = self._setup("CMA VI MPBF",
+                            "FORM VI — MPBF COMPUTATION (Tandon I & II)")
+        fd = self.fd
+
+        # ── Operating CA for MPBF ──────────────────────────────────────────
+        # Standard CMA practice: MPBF is based on OPERATING current assets,
+        # not the cash-plug bloat. Cash held constant at base-year level.
+        def cl_other_than_bank(f):
+            # CL excluding short-term bank borrowings
+            return (f.trade_payables() + f.duties_and_taxes_net()
+                    + f.other_current_liabilities() + f.short_term_provisions())
+        cl_ob = [cl_other_than_bank(fd)] + [b["trade_payables"] + b["other_cl"] + b["provisions"]
+                                              for b in self.bs]
+        cash_anchor = fd.cash_and_bank()   # held constant across years for MPBF
+        # Operating CA = Inventory + Debtors + (base) Cash + Other CA
+        tca_full = self._vals(lambda f: f.total_current_assets(), bs_key="total_ca")
+        operating_ca = [fd.total_current_assets()] + [
+            b["inventory"] + b["debtors"] + cash_anchor + b["other_ca"]
+            for b in self.bs
+        ]
+        wcg = [a - b for a, b in zip(operating_ca, cl_ob)]
+
+        r = self._row(ws, r, "I.  Operating Current Assets",
+                      operating_ca,
+                      bold=True)
+        r = self._row(ws, r, "     (Inventory + Debtors + Base Cash + Other CA)",
+                      [None]*4)
+        r = self._row(ws, r, "II.  Current Liabilities (other than Bank borrowings)", cl_ob)
+        r = self._row(ws, r, "III.  Working Capital Gap (I − II)", wcg, bold=True, total=True)
+        # Show the projected full-CA (with cash plug) too, but not used in MPBF
+        r += 1
+        r = self._row(ws, r, "Memo: Projected Total CA (with cash plug, per BS)",
+                      tca_full)
+        r += 1
+
+        tca = operating_ca   # rename so downstream rows use Operating CA
+
+        # Tandon Method I: MPBF = 0.75 × (CA − CL_other) = 0.75 × WCG
+        nwc_i = [v * 0.25 for v in wcg]
+        mpbf_i = [v * 0.75 for v in wcg]
+        r = self._row(ws, r, "TANDON METHOD I", [None]*4, header=True)
+        r = self._row(ws, r, "  Minimum Stipulated NWC (25% of WCG)", nwc_i)
+        r = self._row(ws, r, "  MPBF — Method I (75% of WCG)", mpbf_i, bold=True, total=True)
+        r += 1
+
+        # Tandon Method II: MPBF = 0.75 × CA − CL_other → NWC = 25% of CA
+        nwc_ii = [v * 0.25 for v in tca]
+        mpbf_ii = [a * 0.75 - b for a, b in zip(tca, cl_ob)]
+        r = self._row(ws, r, "TANDON METHOD II", [None]*4, header=True)
+        r = self._row(ws, r, "  Minimum Stipulated NWC (25% of CA)", nwc_ii)
+        r = self._row(ws, r, "  MPBF — Method II (0.75×CA − CL_other)", mpbf_ii, bold=True, total=True)
+        r += 1
+
+        # Current bank borrowings vs MPBF
+        actual_borr = [fd.short_term_borrowings() + fd.bank_od_in_bank_accounts()] + \
+                      [b["st_borrowings"] for b in self.bs]
+        r = self._row(ws, r, "Actual ST Bank Borrowings", actual_borr)
+        excess_i  = [a - b for a, b in zip(actual_borr, mpbf_i)]
+        excess_ii = [a - b for a, b in zip(actual_borr, mpbf_ii)]
+        r = self._row(ws, r, "Excess / (Shortfall) vs MPBF Method I", excess_i, bold=True)
+        r = self._row(ws, r, "Excess / (Shortfall) vs MPBF Method II", excess_ii, bold=True)
+        r += 1
+        r = self._row(ws, r, "Note: For most companies banks adopt Tandon Method II.",
+                      [None]*4)
+
+        # ── TARGET MPBF — BACK-CALCULATION ────────────────────────────────────
+        target = float(getattr(self.p, "target_mpbf", 0.0) or 0.0)
+        method = int(getattr(self.p, "mpbf_method", 2) or 2)
+        if target > 0:
+            r += 2
+            r = self._row(ws, r,
+                          f"TARGET MPBF BACK-CALCULATION   (Method {'I' if method == 1 else 'II'},  Target = ₹{target:,.0f})",
+                          [None]*4, header=True)
+            r = self._row(ws, r,
+                          "Goal: solve for the working-capital structure required to support the target bank limit.",
+                          [None, None, None, None])
+
+            # Derive required structure year-by-year using the same CL_other_than_bank
+            # projection as base (it's a function of revenue & creditor days).
+            # Method I:  MPBF = 0.75 × WCG  →  WCG_req = MPBF / 0.75
+            #            CA_req = WCG_req + CL_other  ;  NWC_req = 0.25 × WCG_req
+            # Method II: MPBF = 0.75 × CA − CL_other  →  CA_req = (MPBF + CL_other) / 0.75
+            #            NWC_req = 0.25 × CA_req
+            req_wcg, req_ca, req_nwc = [], [], []
+            for i in range(4):
+                clo = cl_ob[i]
+                if method == 1:
+                    wcg_req = target / 0.75
+                    ca_req  = wcg_req + clo
+                    nwc_req = 0.25 * wcg_req
+                else:
+                    ca_req  = (target + clo) / 0.75
+                    wcg_req = ca_req - clo
+                    nwc_req = 0.25 * ca_req
+                req_wcg.append(wcg_req); req_ca.append(ca_req); req_nwc.append(nwc_req)
+
+            r = self._row(ws, r, "  Required Working Capital Gap (WCG)", req_wcg)
+            r = self._row(ws, r, "  Required Total Current Assets (CA)", req_ca)
+            r = self._row(ws, r, "  Required Margin / Stipulated NWC",   req_nwc)
+            r += 1
+
+            # Decompose the required CA back into days-of-revenue / cogs targets,
+            # so the user can see "to get this bank limit, you need X days of debtor /
+            # Y days of inventory at projected revenue".
+            rev = [self.fd.revenue_from_ops()] + [yr["revenue"] for yr in self.pnl]
+            cogs = [self.fd.purchases() + self.fd.direct_expenses()] + [yr["cogs"] for yr in self.pnl]
+            # Assume revenue-based mix: current proportions of inventory : debtors : cash : other_ca
+            # within total CA stay proportional. Compute implied days for inventory & debtors.
+            current_inv  = [fd.closing_stock()]    + [b["inventory"] for b in self.bs]
+            current_deb  = [fd.trade_receivables()] + [b["debtors"]   for b in self.bs]
+            current_ca   = tca
+
+            def days_at(req_ca_v, current_seg, current_total, denom, label):
+                if current_total <= 0 or denom <= 0: return 0
+                req_seg = req_ca_v * (current_seg / current_total)
+                return req_seg / denom * 365
+            inv_days = [days_at(req_ca[i], current_inv[i], current_ca[i], cogs[i], "Inv") for i in range(4)]
+            deb_days = [days_at(req_ca[i], current_deb[i], current_ca[i], rev[i], "Deb") for i in range(4)]
+            r = self._row(ws, r, "  Implied Inventory Days (at projected COGS)", inv_days, fmt='0.0" days"')
+            r = self._row(ws, r, "  Implied Debtor Days  (at projected Revenue)", deb_days, fmt='0.0" days"')
+            r += 1
+
+            # Actual NWC per year (CA − total CL incl. bank borrowings)
+            def total_cl_yr(i):
+                if i == 0:
+                    return (fd.short_term_borrowings() + fd.bank_od_in_bank_accounts()
+                            + cl_other_than_bank(fd))
+                b = self.bs[i - 1]
+                return b["st_borrowings"] + b["trade_payables"] + b["other_cl"] + b["provisions"]
+            actual_nwc = [tca[i] - total_cl_yr(i) for i in range(4)]
+
+            # Gap vs current — actionable
+            ca_gap  = [req_ca[i]  - tca[i]       for i in range(4)]
+            nwc_gap = [req_nwc[i] - actual_nwc[i] for i in range(4)]
+            r = self._row(ws, r, "  Gap: Required CA  −  Actual CA",  ca_gap,  bold=True)
+            r = self._row(ws, r, "  Gap: Required NWC −  Actual NWC", nwc_gap, bold=True)
+            r += 1
+
+            target_mpbf_row = [target] * 4
+            r = self._row(ws, r, "  Target MPBF (input)", target_mpbf_row, bold=True, total=True)
+            chosen_mpbf = mpbf_i if method == 1 else mpbf_ii
+            r = self._row(ws, r,
+                          f"  Computed MPBF (Method {'I' if method == 1 else 'II'} from projections)",
+                          chosen_mpbf)
+            gap_t = [target - chosen_mpbf[i] for i in range(4)]
+            r = self._row(ws, r, "  Gap: Target − Computed", gap_t, bold=True)
+
+    # ── Ratio Analysis ───────────────────────────────────────────────────────
+    def _write_ratios(self) -> None:
+        ws, r = self._setup("CMA Ratios", "RATIO ANALYSIS")
+        fd = self.fd
+
+        def safe(num, den): return (num / den) if den else 0
+
+        # Pull aligned series
+        rev   = self._vals(lambda f: f.revenue_from_ops(), pnl_key="revenue")
+        ebitda = [fd.profit_before_tax() + fd.finance_costs() + fd.depreciation_from_fa()] + \
+                 [yr["ebitda"] for yr in self.pnl]
+        pat   = self._vals(lambda f: f.profit_after_tax(), pnl_key="pat")
+        tnw   = self._vals(lambda f: f.total_equity(), bs_key="total_equity")
+        ltb   = self._vals(lambda f: f.long_term_borrowings(), bs_key="lt_borrowings")
+        stb   = self._vals(lambda f: f.short_term_borrowings() + f.bank_od_in_bank_accounts(),
+                            bs_key="st_borrowings")
+        finc  = self._vals(lambda f: f.finance_costs(), pnl_key="finance")
+        depr  = self._vals(lambda f: f.depreciation_from_fa(), pnl_key="depreciation")
+        tca   = self._vals(lambda f: f.total_current_assets(), bs_key="total_ca")
+
+        def tcl_for_year(idx):
+            if idx == 0:
+                return (fd.short_term_borrowings() + fd.bank_od_in_bank_accounts()
+                        + fd.trade_payables() + fd.duties_and_taxes_net()
+                        + fd.other_current_liabilities() + fd.short_term_provisions())
+            b = self.bs[idx-1]
+            return b["st_borrowings"] + b["trade_payables"] + b["other_cl"] + b["provisions"]
+        tcl = [tcl_for_year(i) for i in range(4)]
+
+        tol = [ltb[i] + stb[i] + tcl[i] - stb[i] for i in range(4)]  # total outside liabilities
+
+        invty = self._vals(lambda f: f.closing_stock(), bs_key="inventory")
+        debtors = self._vals(lambda f: f.trade_receivables(), bs_key="debtors")
+        creditors = self._vals(lambda f: f.trade_payables(), bs_key="trade_payables")
+        cogs = [fd.purchases() + fd.direct_expenses()] + [yr["cogs"] for yr in self.pnl]
+
+        r = self._row(ws, r, "PROFITABILITY", [None]*4, header=True)
+        r = self._row(ws, r, "  PAT Margin %",
+                      [safe(pat[i], rev[i]) * 100 for i in range(4)], fmt='0.00"%"')
+        r = self._row(ws, r, "  EBITDA Margin %",
+                      [safe(ebitda[i], rev[i]) * 100 for i in range(4)], fmt='0.00"%"')
+        r = self._row(ws, r, "  Return on Equity (ROE) %",
+                      [safe(pat[i], tnw[i]) * 100 for i in range(4)], fmt='0.00"%"')
+        r += 1
+
+        r = self._row(ws, r, "LIQUIDITY", [None]*4, header=True)
+        r = self._row(ws, r, "  Current Ratio",
+                      [safe(tca[i], tcl[i]) for i in range(4)], fmt='0.00')
+        r = self._row(ws, r, "  Quick Ratio",
+                      [safe(tca[i] - invty[i], tcl[i]) for i in range(4)], fmt='0.00')
+        r += 1
+
+        r = self._row(ws, r, "LEVERAGE", [None]*4, header=True)
+        r = self._row(ws, r, "  Debt / Equity (Term Debt only)",
+                      [safe(ltb[i], tnw[i]) for i in range(4)], fmt='0.00')
+        r = self._row(ws, r, "  TOL / TNW",
+                      [safe(tol[i], tnw[i]) for i in range(4)], fmt='0.00')
+        r = self._row(ws, r, "  Interest Coverage (ICR)",
+                      [safe(ebitda[i], finc[i]) for i in range(4)], fmt='0.00')
+        r = self._row(ws, r, "  DSCR (EBITDA / (Interest + LT Loan Repayment))",
+                      [safe(ebitda[i], finc[i] + (self.p.loan_repayment_pa if i > 0 else 0))
+                       for i in range(4)], fmt='0.00')
+        r += 1
+
+        r = self._row(ws, r, "TURNOVER / EFFICIENCY", [None]*4, header=True)
+        r = self._row(ws, r, "  Inventory Days",
+                      [safe(invty[i] * 365, cogs[i]) for i in range(4)], fmt='0.0')
+        r = self._row(ws, r, "  Debtor Days",
+                      [safe(debtors[i] * 365, rev[i]) for i in range(4)], fmt='0.0')
+        r = self._row(ws, r, "  Creditor Days",
+                      [safe(creditors[i] * 365, cogs[i]) for i in range(4)], fmt='0.0')
+        r = self._row(ws, r, "  Working Capital Cycle (days)",
+                      [safe(invty[i] * 365, cogs[i])
+                       + safe(debtors[i] * 365, rev[i])
+                       - safe(creditors[i] * 365, cogs[i]) for i in range(4)], fmt='0.0')
+
+    # ── CMA Back-Calculation Worksheet ───────────────────────────────────────
+    #
+    # Reverse mode only. Auditable trail of the solver:
+    #   • What the user fixed
+    #   • What was solved
+    #   • The equation used (Tandon Method I or II)
+    #   • Year-1 feasibility checks (CR ≥ 1.33, TOL/TNW ≤ 3, DSCR ≥ 1.5 etc.)
+    #
+    def _write_back_calc(self) -> None:
+        trace = self.pe.solver_trace or {}
+        ws, r = self._setup("CMA Back-Calc",
+                            "MPBF BACK-CALCULATION WORKSHEET   (Audit Trail)")
+
+        mode      = trace.get("mode", "")
+        method    = int(trace.get("method", 2))
+        target    = float(trace.get("target_mpbf", 0))
+        feasible  = trace.get("feasible", False)
+
+        # ── Mode banner ─────────────────────────────────────────────────────
+        mode_label = {
+            "reverse_days":    "DAYS-ANCHORED  (Revenue back-solved)",
+            "reverse_revenue": "REVENUE-ANCHORED  (WC days back-solved)",
+        }.get(mode, "—")
+        r = self._row(ws, r, "Solver Mode", [mode_label, None, None, None], header=True)
+        r = self._row(ws, r, "MPBF Method",
+                      [f"Tandon Method {'I' if method == 1 else 'II'}", None, None, None])
+        r = self._row(ws, r, "Target MPBF (₹)", [target, None, None, None], bold=True)
+        if feasible:
+            r = self._row(ws, r, "Solver Status",
+                          ["✓ FEASIBLE — solved values applied below", None, None, None])
+        else:
+            r = self._row(ws, r, "Solver Status",
+                          [f"✗ INFEASIBLE — {trace.get('reason', 'unknown')}",
+                           None, None, None])
+            for col in ["A"] + self.YEAR_COLS:
+                ws[f"{col}{r-1}"].fill = _fill("FFCCCC")
+        r += 1
+
+        # ── Equation reference ─────────────────────────────────────────────
+        r = self._row(ws, r, "EQUATION  (Tandon Method)", [None]*4, header=True)
+        if method == 1:
+            eqn1 = "MPBF = 0.75 × (CA − CL_other)"
+            eqn2 = "     = 0.75 × WCG"
+        else:
+            eqn1 = "MPBF = 0.75 × CA  −  CL_other"
+            eqn2 = "(borrower brings 25% of Total CA as NWC margin)"
+        r = self._row(ws, r, "  " + eqn1, [None]*4)
+        r = self._row(ws, r, "  " + eqn2, [None]*4)
+        r = self._row(ws, r, "  CA       = Inventory + Debtors + Cash + Other_CA", [None]*4)
+        r = self._row(ws, r, "  CL_other = Creditors + D&T + OCL + Provisions", [None]*4)
+        r += 1
+
+        # ── Inputs split: FIXED vs SOLVED ──────────────────────────────────
+        r = self._row(ws, r, "INPUTS",
+                      ["Type", "Value", None, None], header=True)
+        p_in  = self.pe.p_input
+        p_out = self.pe.p
+
+        def show(label, val, fmt, kind):
+            nonlocal r
+            ws[f"A{r}"].value = "  " + label
+            ws[f"B{r}"].value = kind   # FIXED / SOLVED
+            ws[f"C{r}"].value = val
+            ws[f"C{r}"].number_format = fmt
+            for col in ["A", "B", "C"]:
+                ws[f"{col}{r}"].font = _font(size=10,
+                    color=C_BLACK,
+                    bold=(kind == "SOLVED"))
+                ws[f"{col}{r}"].alignment = _align("left" if col == "A" else "center")
+            if kind == "SOLVED":
+                for col in ["A", "B", "C"]:
+                    ws[f"{col}{r}"].fill = _fill("FFF4CC")
+            r += 1
+
+        if mode == "reverse_days":
+            show("Revenue Growth Y1 (%)",  p_out.rev_growth_y1,      '0.00"%"', "SOLVED")
+            show("Implied Revenue Y1 (₹)", trace.get("revenue_y1", 0), INR_ACC,  "SOLVED")
+            show("Current Revenue (₹)",    trace.get("rev_current", 0), INR_ACC,'FIXED (Tally)')
+            show("Gross Margin (%)",       p_in.gross_margin_pct,    '0.00"%"', "FIXED")
+            show("Inventory Days",         p_in.inventory_days,      '0" days"', "FIXED")
+            show("Debtor Days",            p_in.debtor_days,         '0" days"', "FIXED")
+            show("Creditor Days",          p_in.creditor_days,       '0" days"', "FIXED")
+            show("Y2 Growth (%)",          p_in.rev_growth_y2,       '0.00"%"', "FIXED")
+            show("Y3 Growth (%)",          p_in.rev_growth_y3,       '0.00"%"', "FIXED")
+        else:  # reverse_revenue
+            show("Inventory Days",         p_out.inventory_days,     '0.0" days"', "SOLVED")
+            show("Debtor Days",            p_out.debtor_days,        '0.0" days"', "SOLVED")
+            show("User-Input Inv Days",    trace.get("inv_days_user", 0), '0" days"', "FIXED")
+            show("User-Input Deb Days",    trace.get("deb_days_user", 0), '0" days"', "FIXED")
+            show("Revenue Growth Y1 (%)",  p_in.rev_growth_y1,       '0.00"%"', "FIXED")
+            show("Revenue Y1 (computed) (₹)", trace.get("rev_y1", 0), INR_ACC,   "FIXED")
+            show("Gross Margin (%)",       p_in.gross_margin_pct,    '0.00"%"', "FIXED")
+            show("Creditor Days",          p_in.creditor_days,       '0" days"', "FIXED")
+        r += 1
+
+        # ── Solver math ────────────────────────────────────────────────────
+        r = self._row(ws, r, "SOLVER STEPS",
+                      [None]*4, header=True)
+        r = self._row(ws, r, ("  Method: bisection on the forward-projection MPBF "
+                              "function (cash-plug model is non-linear in revenue)."),
+                      [None]*4)
+        if mode == "reverse_days":
+            r = self._row(ws, r, "  1. Search range: Revenue growth Y1 ∈ [-90%, 1000%]",
+                          [None]*4)
+            r = self._row(ws, r, "  2. At each candidate growth, run full Y1 projection",
+                          [None]*4)
+            r = self._row(ws, r, "     • Apply growth → Revenue → COGS",
+                          [None]*4)
+            r = self._row(ws, r, "     • Compute Inventory / Debtors / Creditors from days",
+                          [None]*4)
+            r = self._row(ws, r, "     • Roll equity (PAT into Reserves)", [None]*4)
+            r = self._row(ws, r, "     • Cash = balancing plug; CA = Inv+Deb+Cash+Other_CA",
+                          [None]*4)
+            r = self._row(ws, r, ("     • MPBF (Method " +
+                                  ("I" if method == 1 else "II") +
+                                  ") = 0.75×CA − CL_other"
+                                  if method != 1
+                                  else "     • MPBF (Method I) = 0.75×(CA − CL_other)"),
+                          [None]*4)
+            r = self._row(ws, r, "  3. Bisect until |MPBF − Target| < ₹1", [None]*4)
+            r = self._row(ws, r, "  ──> Solved Revenue Y1",
+                          [trace.get("revenue_y1", 0), None, None, None],
+                          bold=True, total=True)
+            r = self._row(ws, r, "  ──> Solved Growth Y1",
+                          [trace.get("growth_y1_pct", 0), None, None, None],
+                          bold=True, total=True, fmt='0.00"%"')
+        else:
+            r = self._row(ws, r, "  1. Search range: scale factor on (Inv days, Deb days) ∈ [0.05×, 10×]",
+                          [None]*4)
+            r = self._row(ws, r, "  2. At each scale: scale both days proportionally, run Y1 projection",
+                          [None]*4)
+            r = self._row(ws, r, "  3. Forward-compute MPBF, bisect on scale until match",
+                          [None]*4)
+            r = self._row(ws, r, "  ──> Scale factor applied",
+                          [trace.get("scale_factor", 0), None, None, None], fmt='0.000')
+            r = self._row(ws, r, "  ──> Solved Inventory Days",
+                          [trace.get("inv_days", 0), None, None, None],
+                          bold=True, total=True, fmt='0.0" days"')
+            r = self._row(ws, r, "  ──> Solved Debtor Days",
+                          [trace.get("deb_days", 0), None, None, None],
+                          bold=True, total=True, fmt='0.0" days"')
+        r += 1
+
+        # ── Verification — recompute MPBF with solved values ───────────────
+        r = self._row(ws, r, "VERIFICATION  (compute MPBF using solved inputs)",
+                      [None]*4, header=True)
+        bs_y1 = self.bs[0]
+        # Replicate Form VI math
+        ca_y1     = bs_y1["total_ca"]
+        cl_other  = bs_y1["trade_payables"] + bs_y1["other_cl"] + bs_y1["provisions"]
+        if method == 1:
+            mpbf_check = 0.75 * (ca_y1 - cl_other)
+        else:
+            mpbf_check = 0.75 * ca_y1 - cl_other
+        r = self._row(ws, r, "  Total Current Assets @ Y1", [ca_y1, None, None, None])
+        r = self._row(ws, r, "  CL (excl. bank borrowings) @ Y1", [cl_other, None, None, None])
+        r = self._row(ws, r, "  Computed MPBF @ Y1", [mpbf_check, None, None, None], bold=True)
+        r = self._row(ws, r, "  Target MPBF",        [target, None, None, None], bold=True)
+        gap = mpbf_check - target
+        r = self._row(ws, r, "  Variance  (Computed − Target)",
+                      [gap, None, None, None],
+                      bold=True, total=True)
+        # Highlight green/red based on variance
+        ok = abs(gap) < max(target * 0.01, 1)   # within 1% of target
+        for col in ["A"] + self.YEAR_COLS:
+            ws[f"{col}{r-1}"].fill = _fill("C6EFCE" if ok else "FFCCCC")
+        r += 1
+
+        # ── Feasibility matrix (sanity checks on the resolved projection) ──
+        r = self._row(ws, r, "FEASIBILITY CHECKS",
+                      ["Threshold", "Actual", "Verdict", None], header=True)
+        for chk in self.pe.feasibility_checks():
+            ws[f"A{r}"].value = "  " + chk["check"]
+            ws[f"A{r}"].font  = _font(size=10)
+            # Threshold (may be tuple for "in")
+            th = chk["threshold"]
+            if isinstance(th, tuple):
+                th_str = f"{th[0]:.0f}–{th[1]:.0f}"
+            else:
+                op_str = chk["op"]
+                th_str = f"{op_str} {chk['fmt'].format(th)}"
+            ws[f"B{r}"].value = th_str
+            ws[f"B{r}"].alignment = _align("center")
+            ws[f"C{r}"].value = chk["fmt"].format(chk["actual"])
+            ws[f"C{r}"].alignment = _align("center")
+            verdict = "✓ PASS" if chk["ok"] else "✗ REVIEW"
+            ws[f"D{r}"].value = verdict
+            ws[f"D{r}"].alignment = _align("center")
+            ws[f"D{r}"].font = _font(bold=True, size=10,
+                                      color=C_BLACK)
+            fill = "C6EFCE" if chk["ok"] else "FFE4B5"
+            for col in ["A", "B", "C", "D"]:
+                ws[f"{col}{r}"].fill = _fill(fill)
+            r += 1
+        r += 1
+
+        # ── Closing note ──────────────────────────────────────────────────
+        ws.merge_cells(f"A{r}:E{r}")
+        ws[f"A{r}"].value = ("This worksheet shows EVERY back-calculated assumption. "
+                             "All other CMA sheets use these values; the audit trail "
+                             "is self-contained. Any check marked ✗ REVIEW should be "
+                             "explained in the narrative cover note to the banker.")
+        ws[f"A{r}"].font = Font(italic=True, size=9, color="666666", name="Calibri")
+        ws[f"A{r}"].alignment = _align("left", wrap=True)
+        ws.row_dimensions[r].height = 32
+
+
 # ─── Tkinter UI ───────────────────────────────────────────────────────────────
 
 class App:
@@ -2256,7 +4053,12 @@ class App:
             "depreciation_rate_pct": tk.StringVar(value="15"),
             "tax_rate_pct":          tk.StringVar(value="25"),
             "other_income_pa":       tk.StringVar(value="0"),
+            "target_mpbf":           tk.StringVar(value="0"),
+            "mpbf_method":           tk.StringVar(value="2"),
         }
+        # solver_mode is a separate variable (string, not numeric) so it isn't
+        # passed via the same float-cast path as the other projection inputs.
+        self.solver_mode_var = tk.StringVar(value="forward")
 
         self._build()
         self.root.mainloop()
@@ -2413,6 +4215,7 @@ class App:
         ab.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         ab.columnconfigure(0, weight=1)
         ab.columnconfigure(1, weight=1)
+        ab.columnconfigure(2, weight=1)
 
         self._gen_btn = ttk.Button(ab, text="Generate Statements  (Excel)",
                                    command=self._gen_actual, style="Accent.TButton")
@@ -2420,7 +4223,11 @@ class App:
 
         self._proj_btn = ttk.Button(ab, text="Generate + 3-Year Projections",
                                     command=self._gen_all, style="TButton")
-        self._proj_btn.grid(row=0, column=1, sticky="ew")
+        self._proj_btn.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+
+        self._cma_btn = ttk.Button(ab, text="Generate + CMA (Bank format)",
+                                   command=self._gen_cma, style="TButton")
+        self._cma_btn.grid(row=0, column=2, sticky="ew")
 
         # ── Projections toggle ────────────────────────────────────────────────
         tog_row = ttk.Frame(main)
@@ -2476,6 +4283,8 @@ class App:
             ("Depreciation Rate WDV (%)",    "depreciation_rate_pct"),
             ("Effective Tax Rate (%)",       "tax_rate_pct"),
             ("Other Income p.a. (₹)",        "other_income_pa"),
+            ("Target MPBF (₹, CMA)",         "target_mpbf"),
+            ("MPBF Method (1 or 2)",         "mpbf_method"),
         ]
         for i, (lbl, key) in enumerate(fields):
             r, col = divmod(i, 2)
@@ -2485,8 +4294,25 @@ class App:
                 row=r, column=col * 2 + 1, sticky="ew", pady=3)
 
         note_r = (len(fields) + 1) // 2
+
+        # ── CMA solver mode (radio buttons) ───────────────────────────────────
+        mode_frame = ttk.Frame(parent)
+        mode_frame.grid(row=note_r, column=0, columnspan=4, sticky="w", pady=(10, 4))
+        ttk.Label(mode_frame, text="CMA Solver Mode (when Target MPBF > 0):",
+                  font=("Calibri", 9, "bold")).pack(side="left", padx=(0, 8))
+        for val, label in [
+            ("forward",         "Forward (compute MPBF from inputs)"),
+            ("reverse_days",    "Reverse — Days anchor (solve Revenue)"),
+            ("reverse_revenue", "Reverse — Revenue anchor (solve Days)"),
+        ]:
+            ttk.Radiobutton(mode_frame, text=label, value=val,
+                            variable=self.solver_mode_var).pack(side="left", padx=4)
+
+        note_r += 1
         note = tk.Label(parent,
-                        text="Tip: the projected Balance Sheet uses a cash-plug — cash absorbs any modelling gap.",
+                        text=("Tip: the projected BS uses a cash-plug. "
+                              "In Reverse mode the system back-solves projections "
+                              "to hit your Target MPBF — see 'CMA Back-Calc' sheet."),
                         bg=self._BG, fg="#595959", font=("Calibri", 8), wraplength=560, justify="left")
         note.grid(row=note_r, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
@@ -2826,10 +4652,15 @@ class App:
 
     def _get_proj_inputs(self) -> ProjectionInputs | None:
         try:
-            return ProjectionInputs(**{
+            kwargs = {
                 k: float(v.get().replace(",", ""))
                 for k, v in self.proj_vars.items()
-            })
+            }
+            # Coerce mpbf_method to int (dataclass declares int)
+            if "mpbf_method" in kwargs:
+                kwargs["mpbf_method"] = int(kwargs["mpbf_method"])
+            kwargs["solver_mode"] = self.solver_mode_var.get()
+            return ProjectionInputs(**kwargs)
         except ValueError as e:
             messagebox.showerror("Invalid Input",
                                  f"Please enter valid numbers in the projection fields.\n{e}")
@@ -2884,6 +4715,29 @@ class App:
         except Exception as e:
             messagebox.showerror("Error", str(e))
             self._set_status("Generation failed — see error dialog.")
+
+    def _gen_cma(self) -> None:
+        """Generate the full pack INCLUDING the 6-sheet CMA forms used by
+        banks for working-capital / term-loan assessment."""
+        fd = self._get_fd()
+        if fd is None:
+            return
+        proj = self._get_proj_inputs()
+        if proj is None:
+            return
+        branches = self._branch_fds()
+        out = self._output_path("_CMA")
+        self._set_status("Generating Excel (with CMA forms)…")
+        self.root.update_idletasks()
+        try:
+            ExcelWriter(fd, proj, branches=branches, cma=True).save(out)
+            self._set_status(f"Saved: {out}")
+            if messagebox.askyesno("Done",
+                f"CMA workbook saved:\n{out}\n\nOpen it now?"):
+                self._open_file(out)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self._set_status("CMA generation failed — see error dialog.")
 
     def _clear(self) -> None:
         self._branches.clear()

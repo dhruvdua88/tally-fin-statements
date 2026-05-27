@@ -58,7 +58,7 @@ fi
 echo
 
 # ── 3. Install / upgrade dependencies ────────────────────────────────────────
-echo "..  Installing packages (openpyxl)..."
+echo "..  Installing packages (openpyxl, PySide6)..."
 "$VENV/bin/pip" install --upgrade pip --quiet
 "$VENV/bin/pip" install --upgrade -r requirements.txt --quiet
 if [ $? -ne 0 ]; then
@@ -71,7 +71,7 @@ echo
 # ── 4. Launch ────────────────────────────────────────────────────────────────
 echo ">>  Starting app — this window can be closed once it opens."
 echo
-"$VENV/bin/python" financial_statements.py
+"$VENV/bin/python" app.py
 
 if [ $? -ne 0 ]; then
     echo

@@ -45,7 +45,7 @@ if not exist ".venv\" (
 echo.
 
 REM --- 3. Install / upgrade dependencies -------------------------------------
-echo [..] Installing packages (openpyxl)...
+echo [..] Installing packages (openpyxl, PySide6)...
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip --quiet
 python -m pip install --upgrade -r requirements.txt --quiet
@@ -60,7 +60,7 @@ echo.
 REM --- 4. Launch -------------------------------------------------------------
 echo [^>^>] Starting app - this window can be closed once it opens.
 echo.
-python financial_statements.py
+python app.py
 
 if errorlevel 1 (
     echo.

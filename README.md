@@ -1,12 +1,18 @@
 # Tally Financial Statements Generator
 
-## ⬇ Download
+## ⬇ Download — ready-to-run app (no Python, no setup)
 
-> ### **➡ [Download ZIP (direct, always latest)](https://github.com/dhruvdua88/tally-fin-statements/archive/refs/heads/main.zip) ⬅**
->
-> Clicking the link downloads `tally-fin-statements-main.zip` immediately — no intermediate page. The ZIP contains the app plus one-click launchers for **Mac** (`run_mac.command`) and **Windows** (`run_windows.bat`). No coding required — see [Install & Run](#install--run-no-coding-needed) below.
->
-> Prefer a tagged release? Browse all versions at [github.com/dhruvdua88/tally-fin-statements/releases](https://github.com/dhruvdua88/tally-fin-statements/releases).
+Pick your computer and click. The file downloads immediately — there is **nothing to install** and no coding required.
+
+> ### 🪟 **[Download for Windows](https://github.com/dhruvdua88/tally-fin-statements/releases/latest/download/Tally-FinStatements-Windows.zip)**
+> Unzip, then double-click **`TallyFinStatements.exe`**. That's it.
+
+> ### 🍎 **[Download for Mac](https://github.com/dhruvdua88/tally-fin-statements/releases/latest/download/Tally-FinStatements-Mac.zip)**
+> Unzip, then **right-click `TallyFinStatements.app` → Open → Open** (first time only — macOS asks because the app isn't from the App Store).
+
+Both links always give you the **latest build** — see [Install & Run](#install--run-no-coding-needed) below for screenshots and troubleshooting.
+
+<sub>Prefer to run from source / on Linux? [Download the source ZIP](https://github.com/dhruvdua88/tally-fin-statements/archive/refs/heads/main.zip) and use the launcher scripts — see [Run from source](#run-from-source).</sub>
 
 You will also need the companion **[TSF Exporter](https://github.com/dhruvdua88/Tally-TSF-Exporter)** to pull data out of TallyPrime — see [How it connects to Tally](#how-it-connects-to-tally).
 
@@ -82,31 +88,40 @@ This app does **not** speak to TallyPrime directly. It reads files produced by t
 
 ## Install & Run (no coding needed)
 
-### Mac
-
-1. Download the ZIP from the link above and unzip it anywhere (e.g. your Desktop)
-2. Right-click **`run_mac.command`** → **Open** → click **Open** in the security dialog
-   *(first time only — macOS flags new downloads; after that you can double-click directly)*
-3. A Terminal window opens, installs the one dependency automatically, then launches the app
-4. The Terminal window can be closed once the app window appears
-
-> **No Python?** The launcher will open `python.org/downloads` for you automatically.
-
 ### Windows
 
-1. Download the ZIP and unzip it anywhere
-2. Double-click **`run_windows.bat`**
-3. A Command Prompt window installs the dependency then opens the app
-4. The Command Prompt can be closed once the app appears
+1. Click **[Download for Windows](https://github.com/dhruvdua88/tally-fin-statements/releases/latest/download/Tally-FinStatements-Windows.zip)**
+2. Right-click the downloaded ZIP → **Extract All**
+3. Double-click **`TallyFinStatements.exe`**
+   *(Windows SmartScreen may warn the first time — click **More info → Run anyway**, because the app isn't code-signed)*
 
-> **No Python?** The launcher opens `python.org/downloads` and explains what to tick ("Add Python to PATH").
+No Python, no internet, no setup required.
 
-### Manual (for developers)
+### Mac
+
+1. Click **[Download for Mac](https://github.com/dhruvdua88/tally-fin-statements/releases/latest/download/Tally-FinStatements-Mac.zip)**
+2. Double-click the downloaded ZIP to unzip it
+3. **Right-click `TallyFinStatements.app` → Open → Open**
+   *(first time only — macOS asks because the app isn't from the App Store; after that you can double-click directly)*
+
+> If macOS says the app "is damaged" or "can't be opened", open **Terminal** and run:
+> `xattr -dr com.apple.quarantine /path/to/TallyFinStatements.app`
+> This clears the download flag macOS adds to unsigned apps.
+
+---
+
+## Run from source
+
+For developers, or to run on **Linux**. Requires Python 3.11+.
 
 ```bash
-pip install openpyxl
-python financial_statements.py
+pip install -r requirements.txt   # openpyxl + PySide6
+python app.py
 ```
+
+Or use the bundled launchers, which create a virtual environment and install
+dependencies automatically: double-click **`run_windows.bat`** (Windows) or
+**`run_mac.command`** (Mac).
 
 ---
 
@@ -148,10 +163,7 @@ python financial_statements.py
 
 ### Step 2 — Generate statements
 
-```bash
-pip install openpyxl
-python financial_statements.py
-```
+Open the app (the downloaded **`TallyFinStatements`** app, or `python app.py` from source).
 
 1. Click **+ Add Branch…**, select your `.zip` file (or `.sqlite` / `.db` if you extracted it). Give the branch a name when prompted.
 2. For two branches: click **+ Add Branch…** again and load the second `.zip`. Both branches must cover the same period.
@@ -399,10 +411,12 @@ In short: the data path is well-validated, but the source data must reflect a ye
 
 ```
 tally-fin-statements/
-├── financial_statements.py   # Single-file app — everything is here
-├── run_mac.command           # Mac one-click launcher
-├── run_windows.bat           # Windows one-click launcher
-├── requirements.txt          # openpyxl>=3.1.0
+├── app.py                    # Desktop UI (PySide6) — the program you run
+├── financial_statements.py   # Accounting + Excel engine (imported by app.py)
+├── run_mac.command           # Mac launcher (run from source)
+├── run_windows.bat           # Windows launcher (run from source)
+├── requirements.txt          # openpyxl + PySide6
+├── .github/workflows/build.yml  # Cloud build → Windows .exe + Mac .app on each release
 └── README.md                 # This file
 ```
 

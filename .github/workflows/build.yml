@@ -1,0 +1,78 @@
+name: Build downloadable apps
+
+# Builds the Windows .exe and the macOS .app in the cloud and attaches
+# ready-to-run ZIPs to a GitHub Release. The README links straight to the
+# "latest release" download URLs, so end users just click and download.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: Tally-FinStatements-Windows.zip
+          - os: macos-latest
+            artifact: Tally-FinStatements-Mac.zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build Windows .exe
+        if: runner.os == 'Windows'
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name TallyFinStatements app.py
+
+      - name: Package Windows ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/TallyFinStatements.exe -DestinationPath ${{ matrix.artifact }} -Force
+
+      - name: Build macOS .app
+        if: runner.os == 'macOS'
+        run: >
+          pyinstaller --noconfirm --clean --windowed
+          --name TallyFinStatements app.py
+
+      - name: Package macOS ZIP
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent TallyFinStatements.app ../${{ matrix.artifact }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
+          fail_on_unmatched_files: true
